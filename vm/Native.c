@@ -120,9 +120,10 @@ void dvmResolveNativeMethod(const u4* args, JValue* pResult,
 
     IF_LOGW() {
         char* desc = dexProtoCopyMethodDescriptor(&method->prototype);
-        LOGW("No implementation found for native %s.%s %s\n",
+        LOGE("ERROR: Calling native function %s.%s %s without implementation - skipping. (undefined behaviour)\n",
             clazz->descriptor, method->name, desc);
         free(desc);
+        return;
     }
 
     dvmThrowException("Ljava/lang/UnsatisfiedLinkError;", method->name);

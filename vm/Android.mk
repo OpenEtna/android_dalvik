@@ -38,6 +38,7 @@ dvm_arch := $(TARGET_ARCH)
 dvm_arch_variant := $(TARGET_ARCH_VARIANT)
 dvm_simulator := $(TARGET_SIMULATOR)
 
+DEBUG_DALVIK_VM := true
 include $(LOCAL_PATH)/Dvm.mk
 
 # liblog and libcutils are shared for target.

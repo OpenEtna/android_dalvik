@@ -1165,15 +1165,15 @@ static bool dvmRegisterJNIMethod(ClassObject* clazz, const char* methodName,
     if (method == NULL)
         method = dvmFindVirtualMethodByDescriptor(clazz, methodName, signature);
     if (method == NULL) {
-        LOGW("ERROR: Unable to find decl for native %s.%s %s\n",
+        LOGW("WARNING: Unable to find decl for native %s.%s %s\n",
             clazz->descriptor, methodName, signature);
-        goto bail;
+        return true;
     }
 
     if (!dvmIsNativeMethod(method)) {
-        LOGW("Unable to register: not native: %s.%s %s\n",
+        LOGW("WARNING: Unable to register: not native: %s.%s %s\n",
             clazz->descriptor, methodName, signature);
-        goto bail;
+        return true;
     }
 
     if (method->nativeFunc != dvmResolveNativeMethod) {
@@ -1631,6 +1631,7 @@ void dvmCallJNIMethod_staticNoRef(const u4* args, JValue* pResult,
     staticMethodClass = (jobject) method->clazz;
 #endif
 
+    //LOGW("dvmCallJNIMethod_staticNoRef(%d): %s.%s\n", gettid(), method->clazz->descriptor, method->name);
     oldStatus = dvmChangeStatus(self, THREAD_NATIVE);
 
     COMPUTE_STACK_SUM(self);
@@ -1742,6 +1743,33 @@ static jclass FindClass(JNIEnv* env, const char* name)
     }
 
     clazz = dvmFindClassNoInit(descriptor, loader);
+
+#if 0
+    if( clazz == NULL ) {
+      LOGW("WARNING: FindClass() did not find class '%s' - creating stub class\n",name);
+
+      clazz = (ClassObject*) dvmMalloc(sizeof(ClassObject), ALLOC_DEFAULT);
+      if (clazz == NULL)
+        return NULL;
+
+      DVM_OBJECT_INIT(&clazz->obj, gDvm.classJavaLangClass);
+      dvmSetClassSerialNumber(clazz);
+      clazz->descriptor = dvmNameToDescriptor(name);
+      assert(clazz->descriptorAlloc == NULL);
+      clazz->classLoader = loader;
+      //clazz->status == CLASS_INITIALIZED;
+      clazz->status == CLASS_INITIALIZED; // dalvik will try to inialize the class 
+      clazz->virtualMethodCount = 0;
+      clazz->virtualMethods = NULL;
+            
+
+      /* Clear the pending NoClassDefFound Exception */
+      Thread* self = dvmThreadSelf();
+      dvmClearException(self);
+    }
+#endif
+
+
     jclazz = addLocalReference(env, (Object*) clazz);
 
 bail:
@@ -2239,9 +2267,35 @@ static jmethodID GetMethodID(JNIEnv* env, jclass jclazz, const char* name,
             meth = NULL;
         }
         if (meth == NULL) {
-            LOGD("GetMethodID: method not found: %s.%s:%s\n",
-                clazz->descriptor, name, sig);
-            dvmThrowException("Ljava/lang/NoSuchMethodError;", name);
+            LOGW("WARNING: Method not found: '%s' '%s' in %s - creating stub\n",
+                 name, sig, clazz->descriptor);
+#if 1
+            /* create new method */
+            clazz->virtualMethodCount++;
+            Method* oldMeth = clazz->virtualMethods;
+            clazz->virtualMethods = (Method*) dvmLinearAlloc(clazz->classLoader,
+                                        clazz->virtualMethodCount * sizeof(Method));
+            int i;
+            for( i = 0; i< clazz->virtualMethodCount; ++i) {
+              if( i == clazz->virtualMethodCount-1 ) {
+                clazz->virtualMethods[i].clazz = clazz;
+                clazz->virtualMethods[i].name = name;
+                clazz->virtualMethods[i].accessFlags |= ACC_NATIVE;
+                clazz->virtualMethods[i].nativeFunc = (DalvikBridgeFunc) dvmAbstractMethodStub;
+                clazz->virtualMethods[i].prototype.dexFile = 0;
+              } else {
+                clazz->virtualMethods[i] = oldMeth[i];
+              }
+            }
+
+            if( oldMeth != NULL ) {
+              dvmLinearFree( clazz->classLoader, oldMeth );
+            }
+            meth = &clazz->virtualMethods[clazz->virtualMethodCount-1];
+#else
+            meth = 0xFFFFFFFF;
+            //dvmThrowException("Ljava/lang/NoSuchMethodError;", name);
+#endif
         }
 
         /*
