@@ -1177,7 +1177,7 @@ static bool dvmRegisterJNIMethod(ClassObject* clazz, const char* methodName,
     }
 
     if (method->nativeFunc != dvmResolveNativeMethod) {
-        LOGW("Warning: %s.%s %s was already registered/resolved?\n",
+        LOGW("Warning: %s.%s %s was already registered/resolved - overwriting\n",
             clazz->descriptor, methodName, signature);
         /* keep going, I guess */
     }
