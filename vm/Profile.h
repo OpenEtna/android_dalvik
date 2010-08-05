@@ -39,7 +39,6 @@ void dvmProfilingShutdown(void);
 /*
  * Method trace state.  This is currently global.  In theory we could make
  * most of this per-thread.
- *
  */
 typedef struct MethodTraceState {
     /* these are set during VM init */
@@ -50,6 +49,7 @@ typedef struct MethodTraceState {
     pthread_mutex_t startStopLock;
     pthread_cond_t  threadExitCond;
     FILE*   traceFile;
+    bool    directToDdms;
     int     bufferSize;
     int     flags;
 
@@ -80,6 +80,9 @@ typedef struct AllocProfState {
 
     int     gcCount;            // #of times an allocation triggered a GC
 
+    int     classInitCount;     // #of initialized classes
+    u8      classInitTime;      // cumulative time spent in class init (nsec)
+
 #if PROFILE_EXTERNAL_ALLOCATIONS
     int     externalAllocCount; // #of calls to dvmTrackExternalAllocation()
     int     externalAllocSize;  // #of bytes passed to ...ExternalAllocation()
@@ -97,7 +100,7 @@ typedef struct AllocProfState {
  * Start/stop method tracing.
  */
 void dvmMethodTraceStart(const char* traceFileName, int traceFd, int bufferSize,
-        int flags);
+        int flags, bool directToDdms);
 bool dvmIsMethodTraceActive(void);
 void dvmMethodTraceStop(void);
 

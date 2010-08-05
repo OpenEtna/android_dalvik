@@ -318,12 +318,30 @@ bool dvmJniStartup(void)
 
     dvmInitMutex(&gDvm.jniPinRefLock);
 
+    Method* meth;
+
+    /*
+     * Grab the PhantomReference constructor.
+     */
+    gDvm.classJavaLangRefPhantomReference =
+        dvmFindSystemClassNoInit("Ljava/lang/ref/PhantomReference;");
+    if (gDvm.classJavaLangRefPhantomReference == NULL) {
+        LOGE("Unable to find PhantomReference class\n");
+        return false;
+    }
+    meth= dvmFindDirectMethodByDescriptor(gDvm.classJavaLangRefPhantomReference,
+        "<init>", "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V");
+    if (meth == NULL) {
+        LOGE("Unable to find constructor for PhantomReference\n");
+        return false;
+    }
+    gDvm.methJavaLangRefPhantomReference_init = meth;
+
+
     /*
      * Look up and cache pointers to some direct buffer classes, fields,
      * and methods.
      */
-    Method* meth;
-
     ClassObject* platformAddressClass =
         dvmFindSystemClassNoInit("Lorg/apache/harmony/luni/platform/PlatformAddress;");
     ClassObject* platformAddressFactoryClass =
@@ -423,6 +441,7 @@ void dvmJniShutdown(void)
 #else
     dvmClearReferenceTable(&gDvm.jniGlobalRefTable);
 #endif
+    dvmClearReferenceTable(&gDvm.jniPinRefTable);
 }
 
 
@@ -573,6 +592,7 @@ Object* dvmDecodeIndirectRef(JNIEnv* env, jobject jobj)
         break;
     case kIndirectKindWeakGlobal:
         {
+            // TODO: implement
             LOGE("weak-global not yet supported\n");
             result = NULL;
             dvmAbort();
@@ -898,6 +918,143 @@ bail:
     dvmUnlockMutex(&gDvm.jniGlobalRefLock);
 }
 
+
+/*
+ * Get the "magic" JNI weak global ReferenceQueue.  It's allocated on
+ * first use.
+ *
+ * Returns NULL with an exception raised if allocation fails.
+ */
+static Object* getWeakGlobalRefQueue(void)
+{
+    /* use an indirect variable to avoid "type-punned pointer" complaints */
+    Object** pGlobalQ = &gDvm.jniWeakGlobalRefQueue;
+
+    if (*pGlobalQ != NULL)
+        return *pGlobalQ;
+
+    ClassObject* clazz = dvmFindSystemClass("Ljava/lang/ref/ReferenceQueue;");
+    if (clazz == NULL) {
+        LOGE("Unable to find java.lang.ref.ReferenceQueue");
+        dvmAbort();
+    }
+
+    /*
+     * Create an instance of ReferenceQueue.  The object is never actually
+     * used for anything, so we don't need to call a constructor.  (We could
+     * get away with using an instance of Object, but this is cleaner.)
+     */
+    Object* queue = dvmAllocObject(clazz, ALLOC_DEFAULT);
+    if (queue == NULL) {
+        LOGW("Failed allocating weak global ref queue\n");
+        assert(dvmCheckException(dvmThreadSelf()));
+        return NULL;
+    }
+    dvmReleaseTrackedAlloc(queue, NULL);
+
+    /*
+     * Save it, using atomic ops to ensure we don't double-up.  The gDvm
+     * field is known to the GC.
+     */
+    if (!ATOMIC_CMP_SWAP((int*) pGlobalQ, 0, (int) queue)) {
+        LOGD("WOW: lost race to create weak global ref queue\n");
+        queue = *pGlobalQ;
+    }
+
+    return queue;
+}
+
+
+/*
+ * We create a PhantomReference that references the object, add a
+ * global reference to it, and then flip some bits before returning it.
+ * The last step ensures that we detect it as special and that only
+ * appropriate calls will accept it.
+ *
+ * On failure, returns NULL with an exception pending.
+ */
+static jweak createWeakGlobalRef(JNIEnv* env, jobject jobj)
+{
+    if (jobj == NULL)
+        return NULL;
+
+    Thread* self = ((JNIEnvExt*)env)->self;
+    Object* obj = dvmDecodeIndirectRef(env, jobj);
+    Object* weakGlobalQueue = getWeakGlobalRefQueue();
+    Object* phantomObj;
+    jobject phantomRef;
+
+    /*
+     * Allocate a PhantomReference, then call the constructor to set
+     * the referent and the reference queue.
+     *
+     * We use a "magic" reference queue that the GC knows about; it behaves
+     * more like a queueless WeakReference, clearing the referent and
+     * not calling enqueue().
+     */
+    if (!dvmIsClassInitialized(gDvm.classJavaLangRefPhantomReference))
+        dvmInitClass(gDvm.classJavaLangRefPhantomReference);
+    phantomObj = dvmAllocObject(gDvm.classJavaLangRefPhantomReference,
+            ALLOC_DEFAULT);
+    if (phantomObj == NULL) {
+        assert(dvmCheckException(self));
+        LOGW("Failed on WeakGlobalRef alloc\n");
+        return NULL;
+    }
+
+    JValue unused;
+    dvmCallMethod(self, gDvm.methJavaLangRefPhantomReference_init, phantomObj,
+        &unused, jobj, weakGlobalQueue);
+    dvmReleaseTrackedAlloc(phantomObj, self);
+
+    if (dvmCheckException(self)) {
+        LOGW("PhantomReference init failed\n");
+        return NULL;
+    }
+
+    LOGV("+++ WGR: created phantom ref %p for object %p\n", phantomObj, obj);
+
+    /*
+     * Add it to the global reference table, and mangle the pointer.
+     */
+    phantomRef = addGlobalReference(phantomObj);
+    return dvmObfuscateWeakGlobalRef(phantomRef);
+}
+
+/*
+ * Delete the global reference that's keeping the PhantomReference around.
+ * The PhantomReference will eventually be discarded by the GC.
+ */
+static void deleteWeakGlobalRef(JNIEnv* env, jweak wref)
+{
+    if (wref == NULL)
+        return;
+
+    jobject phantomRef = dvmNormalizeWeakGlobalRef(wref);
+    deleteGlobalReference(phantomRef);
+}
+
+/*
+ * Extract the referent from a PhantomReference.  Used for weak global
+ * references.
+ *
+ * "jwobj" is a "mangled" WGR pointer.
+ */
+static Object* getPhantomReferent(JNIEnv* env, jweak jwobj)
+{
+    jobject jobj = dvmNormalizeWeakGlobalRef(jwobj);
+    Object* obj = dvmDecodeIndirectRef(env, jobj);
+
+    if (obj->clazz != gDvm.classJavaLangRefPhantomReference) {
+        LOGE("%p is not a phantom reference (%s)\n",
+            jwobj, obj->clazz->descriptor);
+        return NULL;
+    }
+
+    return dvmGetFieldObject(obj, gDvm.offJavaLangRefReference_referent);
+}
+
+
 /*
  * Objects don't currently move, so we just need to create a reference
  * that will ensure the array object isn't collected.
@@ -964,6 +1121,27 @@ static void unpinPrimitiveArray(ArrayObject* arrayObj)
 
 bail:
     dvmUnlockMutex(&gDvm.jniPinRefLock);
+}
+
+/*
+ * Dump the contents of the JNI reference tables to the log file.
+ *
+ * We only dump the local refs associated with the current thread.
+ */
+void dvmDumpJniReferenceTables(void)
+{
+    Thread* self = dvmThreadSelf();
+    JNIEnv* env = self->jniEnv;
+    ReferenceTable* pLocalRefs = getLocalRefTable(env);
+
+#ifdef USE_INDIRECT_REF
+    dvmDumpIndirectRefTable(pLocalRefs, "JNI local");
+    dvmDumpIndirectRefTable(&gDvm.jniGlobalRefTable, "JNI global");
+#else
+    dvmDumpReferenceTable(pLocalRefs, "JNI local");
+    dvmDumpReferenceTable(&gDvm.jniGlobalRefTable, "JNI global");
+#endif
+    dvmDumpReferenceTable(&gDvm.jniPinRefTable, "JNI pinned array");
 }
 
 /*
@@ -1120,6 +1298,10 @@ jobjectRefType dvmGetJNIRefType(JNIEnv* env, jobject jobj)
     Thread* self = dvmThreadSelf();
     //Object** top;
     Object** ptr;
+
+    if (dvmIsWeakGlobalRef(jobj)) {
+        return JNIWeakGlobalRefType;
+    }
 
     /* check args */
     if (findInArgList(self, jobj)) {
@@ -1538,6 +1720,7 @@ void dvmCallJNIMethod_general(const u4* args, JValue* pResult,
         (jclass) method->clazz : NULL;
 #endif
 
+    //LOGW("dvmCallJNIMethod_staticNoRef(%d): %s.%s\n", gettid(), method->clazz->descriptor, method->name);
     oldStatus = dvmChangeStatus(self, THREAD_NATIVE);
 
     COMPUTE_STACK_SUM(self);
@@ -1631,7 +1814,6 @@ void dvmCallJNIMethod_staticNoRef(const u4* args, JValue* pResult,
     staticMethodClass = (jobject) method->clazz;
 #endif
 
-    //LOGW("dvmCallJNIMethod_staticNoRef(%d): %s.%s\n", gettid(), method->clazz->descriptor, method->name);
     oldStatus = dvmChangeStatus(self, THREAD_NATIVE);
 
     COMPUTE_STACK_SUM(self);
@@ -2031,8 +2213,13 @@ static jobject PopLocalFrame(JNIEnv* env, jobject jresult)
  */
 static jobject NewGlobalRef(JNIEnv* env, jobject jobj)
 {
+    Object* obj;
+
     JNI_ENTER();
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
+    if (dvmIsWeakGlobalRef(jobj))
+        obj = getPhantomReferent(env, (jweak) jobj);
+    else
+        obj = dvmDecodeIndirectRef(env, jobj);
     jobject retval = addGlobalReference(obj);
     JNI_EXIT();
     return retval;
@@ -2052,10 +2239,15 @@ static void DeleteGlobalRef(JNIEnv* env, jobject jglobalRef)
 /*
  * Add a reference to the local list.
  */
-static jobject NewLocalRef(JNIEnv* env, jobject jref)
+static jobject NewLocalRef(JNIEnv* env, jobject jobj)
 {
+    Object* obj;
+
     JNI_ENTER();
-    Object* obj = dvmDecodeIndirectRef(env, jref);
+    if (dvmIsWeakGlobalRef(jobj))
+        obj = getPhantomReferent(env, (jweak) jobj);
+    else
+        obj = dvmDecodeIndirectRef(env, jobj);
     jobject retval = addLocalReference(env, obj);
     JNI_EXIT();
     return retval;
@@ -3156,7 +3348,7 @@ static jint RegisterNatives(JNIEnv* env, jclass jclazz,
     JNI_ENTER();
 
     ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
-    jint retval;
+    jint retval = JNI_OK;
     int i;
 
     if (gDvm.verboseJni) {
@@ -3169,12 +3361,9 @@ static jint RegisterNatives(JNIEnv* env, jclass jclazz,
                 methods[i].signature, methods[i].fnPtr))
         {
             retval = JNI_ERR;
-            goto bail;
         }
     }
-    retval = JNI_OK;
 
-bail:
     JNI_EXIT();
     return retval;
 }
@@ -3352,23 +3541,18 @@ static void ReleaseStringCritical(JNIEnv* env, jstring jstr,
 static jweak NewWeakGlobalRef(JNIEnv* env, jobject obj)
 {
     JNI_ENTER();
-    // TODO - implement
-    jobject gref = NULL;
-    LOGE("JNI ERROR: NewWeakGlobalRef not implemented\n");
-    dvmAbort();
+    jweak wref = createWeakGlobalRef(env, obj);
     JNI_EXIT();
-    return gref;
+    return wref;
 }
 
 /*
  * Delete the specified weak global reference.
  */
-static void DeleteWeakGlobalRef(JNIEnv* env, jweak obj)
+static void DeleteWeakGlobalRef(JNIEnv* env, jweak wref)
 {
     JNI_ENTER();
-    // TODO - implement
-    LOGE("JNI ERROR: DeleteWeakGlobalRef not implemented\n");
-    dvmAbort();
+    deleteWeakGlobalRef(env, wref);
     JNI_EXIT();
 }
 
@@ -3415,6 +3599,11 @@ static jobject NewDirectByteBuffer(JNIEnv* env, void* address, jlong capacity)
     Object* platformAddress = NULL;
     JValue callResult;
     jobject result = NULL;
+    ClassObject* tmpClazz;
+
+    tmpClazz = gDvm.methOrgApacheHarmonyLuniPlatformPlatformAddress_on->clazz;
+    if (!dvmIsClassInitialized(tmpClazz) && !dvmInitClass(tmpClazz))
+        goto bail;
 
     /* get an instance of PlatformAddress that wraps the provided address */
     dvmCallMethod(self,
@@ -3429,10 +3618,10 @@ static jobject NewDirectByteBuffer(JNIEnv* env, void* address, jlong capacity)
     LOGV("tracking %p for address=%p\n", platformAddress, address);
 
     /* create an instance of java.nio.ReadWriteDirectByteBuffer */
-    ClassObject* clazz = gDvm.classJavaNioReadWriteDirectByteBuffer;
-    if (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz))
+    tmpClazz = gDvm.classJavaNioReadWriteDirectByteBuffer;
+    if (!dvmIsClassInitialized(tmpClazz) && !dvmInitClass(tmpClazz))
         goto bail;
-    Object* newObj = dvmAllocObject(clazz, ALLOC_DONT_TRACK);
+    Object* newObj = dvmAllocObject(tmpClazz, ALLOC_DONT_TRACK);
     if (newObj != NULL) {
         /* call the (PlatformAddress, int, int) constructor */
         result = addLocalReference(env, newObj);
@@ -3739,7 +3928,8 @@ static jint DestroyJavaVM(JavaVM* vm)
     if (ext == NULL)
         return JNI_ERR;
 
-    LOGD("DestroyJavaVM waiting for non-daemon threads to exit\n");
+    if (gDvm.verboseShutdown)
+        LOGD("DestroyJavaVM waiting for non-daemon threads to exit\n");
 
     /*
      * Sleep on a condition variable until it's okay to exit.
@@ -3771,7 +3961,8 @@ shutdown:
     // TODO: call System.exit() to run any registered shutdown hooks
     // (this may not return -- figure out how this should work)
 
-    LOGD("DestroyJavaVM shutting VM down\n");
+    if (gDvm.verboseShutdown)
+        LOGD("DestroyJavaVM shutting VM down\n");
     dvmShutdown();
 
     // TODO - free resources associated with JNI-attached daemon threads
@@ -4272,4 +4463,3 @@ bail:
     free(argv);
     return result;
 }
-

@@ -23,6 +23,17 @@
 #include <sys/types.h>
 
 /*
+ * System page size.  Normally you're expected to get this from
+ * sysconf(_SC_PAGESIZE) or some system-specific define (usually PAGESIZE
+ * or PAGE_SIZE).  If we use a simple #define the compiler can generate
+ * appropriate masks directly, so we define it here and verify it as the
+ * VM is starting up.
+ *
+ * Must be a power of 2.
+ */
+#define SYSTEM_PAGE_SIZE        4096
+
+/*
  * Use this to keep track of mapped segments.
  */
 typedef struct MemMapping {
@@ -55,10 +66,19 @@ int sysLoadFileInShmem(int fd, MemMapping* pMap);
  *
  * On success, "pMap" is filled in, and zero is returned.
  */
-int sysMapFileInShmem(int fd, MemMapping* pMap);
+int sysMapFileInShmemReadOnly(int fd, MemMapping* pMap);
 
 /*
- * Like sysMapFileInShmem, but on only part of a file.
+ * Map a file (from fd's current offset) into a shared, read-only memory
+ * segment that can be made writable.  (In some cases, such as when
+ * mapping a file on a FAT filesystem, the result may be fully writable.)
+ *
+ * On success, "pMap" is filled in, and zero is returned.
+ */
+int sysMapFileInShmemWritableReadOnly(int fd, MemMapping* pMap);
+
+/*
+ * Like sysMapFileInShmemReadOnly, but on only part of a file.
  */
 int sysMapFileSegmentInShmem(int fd, off_t start, long length,
     MemMapping* pMap);
@@ -69,6 +89,15 @@ int sysMapFileSegmentInShmem(int fd, off_t start, long length,
  * On success, "pMap" is filled in, and zero is returned.
  */
 int sysCreatePrivateMap(size_t length, MemMapping* pMap);
+
+/*
+ * Change the access rights on one or more pages.  If "wantReadWrite" is
+ * zero, the pages will be made read-only; otherwise they will be read-write.
+ *
+ * Returns 0 on success.
+ */
+int sysChangeMapAccess(void* addr, size_t length, int wantReadWrite,
+    MemMapping* pmap);
 
 /*
  * Release the pages associated with a shared memory segment.

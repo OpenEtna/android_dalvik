@@ -79,9 +79,20 @@ static void buildInsnString(char *fmt, ArmLIR *lir, char* buf,
                 strcpy(tbuf, "!");
             } else {
                assert(fmt < fmtEnd);
-               assert((unsigned)(nc-'0') < 3);
+               assert((unsigned)(nc-'0') < 4);
                operand = lir->operands[nc-'0'];
                switch(*fmt++) {
+                   case 'b':
+                       strcpy(tbuf,"0000");
+                       for (i=3; i>= 0; i--) {
+                           tbuf[i] += operand & 1;
+                           operand >>= 1;
+                       }
+                       break;
+                   case 'n':
+                       operand = ~expandImmediate(operand);
+                       sprintf(tbuf,"%d [0x%x]", operand, operand);
+                       break;
                    case 'm':
                        operand = expandImmediate(operand);
                        sprintf(tbuf,"%d [0x%x]", operand, operand);
@@ -99,9 +110,6 @@ static void buildInsnString(char *fmt, ArmLIR *lir, char* buf,
                    case 'd':
                        sprintf(tbuf,"%d", operand);
                        break;
-                   case 'D':
-                       sprintf(tbuf,"%d", operand+8);
-                       break;
                    case 'E':
                        sprintf(tbuf,"%d", operand*4);
                        break;
@@ -110,29 +118,29 @@ static void buildInsnString(char *fmt, ArmLIR *lir, char* buf,
                        break;
                    case 'c':
                        switch (operand) {
-                           case ARM_COND_EQ:
-                               strcpy(tbuf, "beq");
+                           case kArmCondEq:
+                               strcpy(tbuf, "eq");
                                break;
-                           case ARM_COND_NE:
-                               strcpy(tbuf, "bne");
+                           case kArmCondNe:
+                               strcpy(tbuf, "ne");
                                break;
-                           case ARM_COND_LT:
-                               strcpy(tbuf, "blt");
+                           case kArmCondLt:
+                               strcpy(tbuf, "lt");
                                break;
-                           case ARM_COND_GE:
-                               strcpy(tbuf, "bge");
+                           case kArmCondGe:
+                               strcpy(tbuf, "ge");
                                break;
-                           case ARM_COND_GT:
-                               strcpy(tbuf, "bgt");
+                           case kArmCondGt:
+                               strcpy(tbuf, "gt");
                                break;
-                           case ARM_COND_LE:
-                               strcpy(tbuf, "ble");
+                           case kArmCondLe:
+                               strcpy(tbuf, "le");
                                break;
-                           case ARM_COND_CS:
-                               strcpy(tbuf, "bcs");
+                           case kArmCondCs:
+                               strcpy(tbuf, "cs");
                                break;
-                           case ARM_COND_MI:
-                               strcpy(tbuf, "bmi");
+                           case kArmCondMi:
+                               strcpy(tbuf, "mi");
                                break;
                            default:
                                strcpy(tbuf, "");
@@ -182,8 +190,49 @@ static void buildInsnString(char *fmt, ArmLIR *lir, char* buf,
     *buf = 0;
 }
 
+void dvmDumpResourceMask(LIR *lir, u8 mask, const char *prefix)
+{
+    char buf[256];
+    buf[0] = 0;
+    ArmLIR *armLIR = (ArmLIR *) lir;
+
+    if (mask == ENCODE_ALL) {
+        strcpy(buf, "all");
+    } else {
+        char num[8];
+        int i;
+
+        for (i = 0; i < kRegEnd; i++) {
+            if (mask & (1ULL << i)) {
+                sprintf(num, "%d ", i);
+                strcat(buf, num);
+            }
+        }
+
+        if (mask & ENCODE_CCODE) {
+            strcat(buf, "cc ");
+        }
+        if (mask & ENCODE_FP_STATUS) {
+            strcat(buf, "fpcc ");
+        }
+        if (armLIR && (mask & ENCODE_DALVIK_REG)) {
+            sprintf(buf + strlen(buf), "dr%d%s", armLIR->aliasInfo & 0xffff,
+                    (armLIR->aliasInfo & 0x80000000) ? "(+1)" : "");
+        }
+    }
+    if (buf[0]) {
+        LOGD("%s: %s", prefix, buf);
+    }
+}
+
+/*
+ * Debugging macros
+ */
+#define DUMP_RESOURCE_MASK(X)
+#define DUMP_SSA_REP(X)
+
 /* Pretty-print a LIR instruction */
-static void dumpLIRInsn(LIR *arg, unsigned char *baseAddr)
+void dvmDumpLIRInsn(LIR *arg, unsigned char *baseAddr)
 {
     ArmLIR *lir = (ArmLIR *) arg;
     char buf[256];
@@ -191,55 +240,87 @@ static void dumpLIRInsn(LIR *arg, unsigned char *baseAddr)
     int offset = lir->generic.offset;
     int dest = lir->operands[0];
     u2 *cPtr = (u2*)baseAddr;
+    const bool dumpNop = false;
+
     /* Handle pseudo-ops individually, and all regular insns as a group */
     switch(lir->opCode) {
-        case ARM_PSEUDO_TARGET_LABEL:
+        case kArmChainingCellBottom:
+            LOGD("-------- end of chaining cells (0x%04x)\n", offset);
             break;
-        case ARM_PSEUDO_CHAINING_CELL_NORMAL:
+        case kArmPseudoBarrier:
+            LOGD("-------- BARRIER");
+            break;
+        case kArmPseudoExtended:
+            /* intentional fallthrough */
+        case kArmPseudoSSARep:
+            DUMP_SSA_REP(LOGD("-------- %s\n", (char *) dest));
+            break;
+        case kArmPseudoTargetLabel:
+            break;
+        case kArmPseudoChainingCellBackwardBranch:
+            LOGD("-------- chaining cell (backward branch): 0x%04x\n", dest);
+            break;
+        case kArmPseudoChainingCellNormal:
             LOGD("-------- chaining cell (normal): 0x%04x\n", dest);
             break;
-        case ARM_PSEUDO_CHAINING_CELL_HOT:
+        case kArmPseudoChainingCellHot:
             LOGD("-------- chaining cell (hot): 0x%04x\n", dest);
             break;
-        case ARM_PSEUDO_CHAINING_CELL_INVOKE_PREDICTED:
+        case kArmPseudoChainingCellInvokePredicted:
             LOGD("-------- chaining cell (predicted)\n");
             break;
-        case ARM_PSEUDO_CHAINING_CELL_INVOKE_SINGLETON:
+        case kArmPseudoChainingCellInvokeSingleton:
             LOGD("-------- chaining cell (invoke singleton): %s/%p\n",
                  ((Method *)dest)->name,
                  ((Method *)dest)->insns);
             break;
-        case ARM_PSEUDO_DALVIK_BYTECODE_BOUNDARY:
-            LOGD("-------- dalvik offset: 0x%04x @ %s\n", dest,
-                   getOpcodeName(lir->operands[1]));
+        case kArmPseudoEntryBlock:
+            LOGD("-------- entry offset: 0x%04x\n", dest);
             break;
-        case ARM_PSEUDO_ALIGN4:
+        case kArmPseudoDalvikByteCodeBoundary:
+            LOGD("-------- dalvik offset: 0x%04x @ %s\n", dest,
+                 (char *) lir->operands[1]);
+            break;
+        case kArmPseudoExitBlock:
+            LOGD("-------- exit offset: 0x%04x\n", dest);
+            break;
+        case kArmPseudoPseudoAlign4:
             LOGD("%p (%04x): .align4\n", baseAddr + offset, offset);
             break;
-        case ARM_PSEUDO_PC_RECONSTRUCTION_CELL:
+        case kArmPseudoPCReconstructionCell:
             LOGD("-------- reconstruct dalvik PC : 0x%04x @ +0x%04x\n", dest,
                  lir->operands[1]);
             break;
-        case ARM_PSEUDO_PC_RECONSTRUCTION_BLOCK_LABEL:
+        case kArmPseudoPCReconstructionBlockLabel:
             /* Do nothing */
             break;
-        case ARM_PSEUDO_EH_BLOCK_LABEL:
+        case kArmPseudoEHBlockLabel:
             LOGD("Exception_Handling:\n");
             break;
-        case ARM_PSEUDO_NORMAL_BLOCK_LABEL:
+        case kArmPseudoNormalBlockLabel:
             LOGD("L%#06x:\n", dest);
             break;
         default:
-            if (lir->isNop) {
+            if (lir->isNop && !dumpNop) {
                 break;
             }
             buildInsnString(EncodingMap[lir->opCode].name, lir, opName,
                             baseAddr, 256);
             buildInsnString(EncodingMap[lir->opCode].fmt, lir, buf, baseAddr,
                             256);
-            LOGD("%p (%04x): %-8s%s\n",
-                 baseAddr + offset, offset, opName, buf);
+            LOGD("%p (%04x): %-8s%s%s\n",
+                 baseAddr + offset, offset, opName, buf,
+                 lir->isNop ? "(nop)" : "");
             break;
+    }
+
+    if (lir->useMask && (!lir->isNop || dumpNop)) {
+        DUMP_RESOURCE_MASK(dvmDumpResourceMask((LIR *) lir,
+                                               lir->useMask, "use"));
+    }
+    if (lir->defMask && (!lir->isNop || dumpNop)) {
+        DUMP_RESOURCE_MASK(dvmDumpResourceMask((LIR *) lir,
+                                               lir->defMask, "def"));
     }
 }
 
@@ -253,12 +334,13 @@ void dvmCompilerCodegenDump(CompilationUnit *cUnit)
     LOGD("installed code is at %p\n", cUnit->baseAddr);
     LOGD("total size is %d bytes\n", cUnit->totalSize);
     for (lirInsn = cUnit->firstLIRInsn; lirInsn; lirInsn = lirInsn->next) {
-        dumpLIRInsn(lirInsn, cUnit->baseAddr);
+        dvmDumpLIRInsn(lirInsn, cUnit->baseAddr);
     }
     for (lirInsn = cUnit->wordList; lirInsn; lirInsn = lirInsn->next) {
         armLIR = (ArmLIR *) lirInsn;
         LOGD("%p (%04x): .word (0x%x)\n",
-             (char*)cUnit->baseAddr + armLIR->generic.offset, armLIR->generic.offset,
+             (char*)cUnit->baseAddr + armLIR->generic.offset,
+             armLIR->generic.offset,
              armLIR->operands[0]);
     }
 }

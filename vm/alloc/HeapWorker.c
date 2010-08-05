@@ -15,10 +15,10 @@
  */
 
 /*
- * An async worker thread to handle certain heap operations that
- * need to be done in a separate thread to avoid synchronization
- * problems.  HeapWorkers and reference clearing/enqueuing are
- * handled by this thread.
+ * An async worker thread to handle certain heap operations that need
+ * to be done in a separate thread to avoid synchronization problems.
+ * HeapWorkers and reference enqueuing are handled by this thread.
+ * The VM does all clearing.
  */
 #include "Dalvik.h"
 #include "HeapInternal.h"
@@ -104,7 +104,7 @@ void dvmHeapWorkerShutdown(void)
          */
         if (pthread_join(gDvm.heapWorkerHandle, &threadReturn) != 0)
             LOGW("HeapWorker thread join failed\n");
-        else
+        else if (gDvm.verboseShutdown)
             LOGD("HeapWorker thread has shut down\n");
 
         gDvm.heapWorkerReady = false;
@@ -145,8 +145,32 @@ void dvmAssertHeapWorkerThreadRunning()
              * watchdog and just reset the timer.
              */
             LOGI("Debugger is attached -- suppressing HeapWorker watchdog\n");
-            heapWorkerInterpStartTime = now;        /* reset timer */
+            gDvm.gcHeap->heapWorkerInterpStartTime = now;   /* reset timer */
         } else if (delta > HEAP_WORKER_WATCHDOG_TIMEOUT) {
+            /*
+             * Before we give up entirely, see if maybe we're just not
+             * getting any CPU time because we're stuck in a background
+             * process group.  If we successfully move the thread into the
+             * foreground we'll just leave it there (it doesn't do anything
+             * if the process isn't GCing).
+             */
+            dvmLockThreadList(NULL);
+            Thread* thread = dvmGetThreadByHandle(gDvm.heapWorkerHandle);
+            dvmUnlockThreadList();
+
+            if (thread != NULL) {
+                int priChangeFlags, threadPrio;
+                SchedPolicy threadPolicy;
+                priChangeFlags = dvmRaiseThreadPriorityIfNeeded(thread,
+                        &threadPrio, &threadPolicy);
+                if (priChangeFlags != 0) {
+                    LOGI("HeapWorker watchdog expired, raising priority"
+                         " and retrying\n");
+                    gDvm.gcHeap->heapWorkerInterpStartTime = now;
+                    return;
+                }
+            }
+
             char* desc = dexProtoCopyMethodDescriptor(
                     &gDvm.gcHeap->heapWorkerCurrentMethod->prototype);
             LOGE("HeapWorker is wedged: %lldms spent inside %s.%s%s\n",
@@ -155,6 +179,9 @@ void dvmAssertHeapWorkerThreadRunning()
                     gDvm.gcHeap->heapWorkerCurrentMethod->name, desc);
             free(desc);
             dvmDumpAllThreads(true);
+
+            /* try to get a debuggerd dump from the target thread */
+            dvmNukeThread(thread);
 
             /* abort the VM */
             dvmAbort();
@@ -221,7 +248,7 @@ static void callMethod(Thread *self, Object *obj, Method *method)
 }
 
 /* Process all enqueued heap work, including finalizers and reference
- * clearing/enqueueing.
+ * enqueueing. Clearing has already been done by the VM.
  *
  * Caller must hold gDvm.heapWorkerLock.
  */
@@ -230,17 +257,9 @@ static void doHeapWork(Thread *self)
     Object *obj;
     HeapWorkerOperation op;
     int numFinalizersCalled, numReferencesEnqueued;
-#if FANCY_REFERENCE_SUBCLASS
-    int numReferencesCleared = 0;
-#endif
 
     assert(gDvm.voffJavaLangObject_finalize >= 0);
-#if FANCY_REFERENCE_SUBCLASS
-    assert(gDvm.voffJavaLangRefReference_clear >= 0);
-    assert(gDvm.voffJavaLangRefReference_enqueue >= 0);
-#else
     assert(gDvm.methJavaLangRefReference_enqueueInternal != NULL);
-#endif
 
     numFinalizersCalled = 0;
     numReferencesEnqueued = 0;
@@ -262,39 +281,11 @@ static void doHeapWork(Thread *self)
             assert(method->clazz != gDvm.classJavaLangObject);
             callMethod(self, obj, method);
         } else {
-#if FANCY_REFERENCE_SUBCLASS
-            /* clear() *must* happen before enqueue(), otherwise
-             * a non-clear reference could appear on a reference
-             * queue.
-             */
-            if (op & WORKER_CLEAR) {
-                numReferencesCleared++;
-                method = obj->clazz->vtable[
-                        gDvm.voffJavaLangRefReference_clear];
-                assert(dvmCompareNameDescriptorAndMethod("clear", "()V",
-                                method) == 0);
-                assert(method->clazz != gDvm.classJavaLangRefReference);
-                callMethod(self, obj, method);
-            }
-            if (op & WORKER_ENQUEUE) {
-                numReferencesEnqueued++;
-                method = obj->clazz->vtable[
-                        gDvm.voffJavaLangRefReference_enqueue];
-                assert(dvmCompareNameDescriptorAndMethod("enqueue", "()Z",
-                                method) == 0);
-                /* We call enqueue() even when it isn't overridden,
-                 * so don't assert(!classJavaLangRefReference) here.
-                 */
-                callMethod(self, obj, method);
-            }
-#else
-            assert((op & WORKER_CLEAR) == 0);
             if (op & WORKER_ENQUEUE) {
                 numReferencesEnqueued++;
                 callMethod(self, obj,
                         gDvm.methJavaLangRefReference_enqueueInternal);
             }
-#endif
         }
 
         /* Let the GC collect the object.
@@ -303,9 +294,6 @@ static void doHeapWork(Thread *self)
     }
     LOGV("Called %d finalizers\n", numFinalizersCalled);
     LOGV("Enqueued %d references\n", numReferencesEnqueued);
-#if FANCY_REFERENCE_SUBCLASS
-    LOGV("Cleared %d overridden references\n", numReferencesCleared);
-#endif
 }
 
 /*
@@ -412,7 +400,8 @@ static void* heapWorkerThreadStart(void* arg)
     }
     dvmUnlockMutex(&gDvm.heapWorkerLock);
 
-    LOGD("HeapWorker thread shutting down\n");
+    if (gDvm.verboseShutdown)
+        LOGD("HeapWorker thread shutting down\n");
     return NULL;
 }
 

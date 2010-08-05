@@ -150,6 +150,7 @@ bool dvmVerifyClass(ClassObject* clazz, int verifyFlags)
     return true;
 }
 
+
 /*
  * Perform verification on a single method.
  *

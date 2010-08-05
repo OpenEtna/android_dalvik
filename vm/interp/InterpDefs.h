@@ -64,17 +64,35 @@ typedef enum InterpEntry {
  *    just been reached).
  * 6) dvmJitToPredictedChain: patch the chaining cell for a virtual call site
  *    to a predicted callee.
+ * 7) dvmJitToBackwardBranch: (WITH_SELF_VERIFICATION ONLY) special case of 1)
+ *    and 5). This is used instead if the ending branch of the trace jumps back
+ *    into the same basic block.
  */
 struct JitToInterpEntries {
     void *dvmJitToInterpNormal;
     void *dvmJitToInterpNoChain;
     void *dvmJitToInterpPunt;
     void *dvmJitToInterpSingleStep;
-    void *dvmJitToTraceSelect;
+    void *dvmJitToInterpTraceSelectNoChain;
+    void *dvmJitToInterpTraceSelect;
     void *dvmJitToPatchPredictedChain;
+#if defined(WITH_SELF_VERIFICATION)
+    void *dvmJitToInterpBackwardBranch;
+#endif
 };
 
-#define JIT_TRACE_THRESH_FILTER_SIZE  16
+/*
+ * Size of save area for callee-save FP regs, which are not automatically
+ * saved by interpreter main because it doesn't use them (but Jit'd code
+ * may). Save/restore routine is defined by target, and size should
+ * be >= max needed by any target.
+ */
+#define JIT_CALLEE_SAVE_DOUBLE_COUNT 8
+
+/* Number of entries in the 2nd level JIT profiler filter cache */
+#define JIT_TRACE_THRESH_FILTER_SIZE 32
+/* Granularity of coverage (power of 2) by each cached entry */
+#define JIT_TRACE_THRESH_FILTER_GRAN_LOG2 6
 #endif
 
 /*
@@ -129,8 +147,17 @@ typedef struct InterpState {
      */
     unsigned char*     pJitProfTable;
     JitState           jitState;
-    void*              jitResume;
-    u2*                jitResumePC;
+    const void*        jitResumeNPC;	// Native PC of compiled code
+    const u2*          jitResumeDPC;	// Dalvik PC corresponding to NPC
+    int                jitThreshold;
+    /*
+     * ppJitProfTable holds the address of gDvmJit.pJitProfTable, which
+     * doubles as an on/off switch for the Jit.  Because a change in
+     * the value of gDvmJit.pJitProfTable isn't reflected in the cached
+     * copy above (pJitProfTable), we need to periodically refresh it.
+     * ppJitProfTable is used for that purpose.
+     */
+    unsigned char**    ppJitProfTable; // Used to refresh pJitProfTable
 #endif
 
 #if defined(WITH_PROFILER) || defined(WITH_DEBUGGER)
@@ -145,12 +172,14 @@ typedef struct InterpState {
 
     int currTraceRun;
     int totalTraceLen;        // Number of Dalvik insts in trace
-    const u2* currTraceHead;        // Start of the trace we're building
-    const u2* currRunHead;          // Start of run we're building
+    const u2* currTraceHead;  // Start of the trace we're building
+    const u2* currRunHead;    // Start of run we're building
     int currRunLen;           // Length of run in 16-bit words
     int lastThreshFilter;
-    const u2* threshFilter[JIT_TRACE_THRESH_FILTER_SIZE];
+    const u2* lastPC;         // Stage the PC first for the threaded interpreter
+    intptr_t threshFilter[JIT_TRACE_THRESH_FILTER_SIZE];
     JitTraceRun trace[MAX_JIT_RUN_LEN];
+    double calleeSave[JIT_CALLEE_SAVE_DOUBLE_COUNT];
 #endif
 
 } InterpState;
@@ -215,9 +244,9 @@ static inline bool dvmDebuggerOrProfilerActive(void)
  * Determine if the jit, debugger or profiler is currently active.  Used when
  * selecting which interpreter to switch to.
  */
-static inline bool dvmJitDebuggerOrProfilerActive(int jitState)
+static inline bool dvmJitDebuggerOrProfilerActive()
 {
-    return jitState != kJitOff
+    return gDvmJit.pProfTable != NULL
 #if defined(WITH_PROFILER)
         || gDvm.activeProfilers != 0
 #endif

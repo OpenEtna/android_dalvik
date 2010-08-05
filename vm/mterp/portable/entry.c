@@ -42,18 +42,26 @@ bool INTERP_FUNC_NAME(Thread* self, InterpState* interpState)
          interpState->pc,
          interpState->method->name);
 #endif
-
 #if INTERP_TYPE == INTERP_DBG
-    /* Check to see if we've got a trace selection request.  If we do,
-     * but something is amiss, revert to the fast interpreter.
-     */
-    if (dvmJitCheckTraceRequest(self,interpState)) {
+    /* Check to see if we've got a trace selection request. */
+    if (
+         /*
+          * Only perform dvmJitCheckTraceRequest if the entry point is
+          * EntryInstr and the jit state is either kJitTSelectRequest or
+          * kJitTSelectRequestHot. If debugger/profiler happens to be attached,
+          * dvmJitCheckTraceRequest will change the jitState to kJitDone but
+          * but stay in the dbg interpreter.
+          */
+         (interpState->entryPoint == kInterpEntryInstr) &&
+         (interpState->jitState == kJitTSelectRequest ||
+          interpState->jitState == kJitTSelectRequestHot) &&
+         dvmJitCheckTraceRequest(self, interpState)) {
         interpState->nextMode = INTERP_STD;
-        //LOGD("** something wrong, exiting\n");
+        //LOGD("Invalid trace request, exiting\n");
         return true;
     }
-#endif
-#endif
+#endif /* INTERP_TYPE == INTERP_DBG */
+#endif /* WITH_JIT */
 
     /* copy state in */
     curMethod = interpState->method;
@@ -86,6 +94,7 @@ bool INTERP_FUNC_NAME(Thread* self, InterpState* interpState)
         /* just fall through to instruction loop or threaded kickstart */
         break;
     case kInterpEntryReturn:
+        CHECK_JIT();
         goto returnFromMethod;
     case kInterpEntryThrow:
         goto exceptionThrown;

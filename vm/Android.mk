@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 #
 # Android.mk for Dalvik VM.
 #
@@ -20,8 +19,11 @@
 # swath of common definitions are factored out into a separate file to
 # minimize duplication.
 #
-# Also, if you enable or disable optional features here (or Dvm.mk),
-# rebuild the VM with "make clean-libdvm && make -j4 libdvm".
+# If you enable or disable optional features here (or in Dvm.mk),
+# rebuild the VM with:
+#
+#  make clean-libdvm clean-libdvm_assert clean-libdvm_sv clean-libdvm_interp
+#  make -j4 libdvm
 #
 
 LOCAL_PATH:= $(call my-dir)
@@ -30,25 +32,56 @@ LOCAL_PATH:= $(call my-dir)
 # Build for the target (device).
 #
 
-include $(CLEAR_VARS)
+#ifeq ($(TARGET_ARCH_VARIANT),armv5te)
+#    WITH_JIT := false
+#endif
 
-# Variables used in the included Dvm.mk.
-dvm_os := $(TARGET_OS)
-dvm_arch := $(TARGET_ARCH)
-dvm_arch_variant := $(TARGET_ARCH_VARIANT)
-dvm_simulator := $(TARGET_SIMULATOR)
+# Build the installed version (libdvm.so) first
+include $(LOCAL_PATH)/ReconfigureDvm.mk
 
-DEBUG_DALVIK_VM := true
-include $(LOCAL_PATH)/Dvm.mk
-
-# liblog and libcutils are shared for target.
-LOCAL_SHARED_LIBRARIES += \
-	liblog libcutils
-
+# Overwrite default settings
+ifneq ($(TARGET_ARCH),x86)
+ifeq ($(TARGET_SIMULATOR),false)
+    LOCAL_PRELINK_MODULE := true
+endif
+endif
+LOCAL_MODULE_TAGS := user
 LOCAL_MODULE := libdvm
-
 include $(BUILD_SHARED_LIBRARY)
 
+# If WITH_JIT is configured, build multiple versions of libdvm.so to facilitate
+# correctness/performance bugs triage
+ifeq ($(WITH_JIT),true)
+
+    # Derivation #1
+    # Enable assert and JIT tuning
+    include $(LOCAL_PATH)/ReconfigureDvm.mk
+
+    # Enable assertions and JIT-tuning
+    LOCAL_CFLAGS += -UNDEBUG -DDEBUG=1 -DLOG_NDEBUG=1 -DWITH_DALVIK_ASSERT \
+				    -DWITH_JIT_TUNING -DJIT_STATS
+    LOCAL_MODULE := libdvm_assert
+    include $(BUILD_SHARED_LIBRARY)
+
+    # Derivation #2
+    # Enable assert and self-verification
+    include $(LOCAL_PATH)/ReconfigureDvm.mk
+
+    # Enable assertions and JIT self-verification
+    LOCAL_CFLAGS += -UNDEBUG -DDEBUG=1 -DLOG_NDEBUG=1 -DWITH_DALVIK_ASSERT \
+					-DWITH_SELF_VERIFICATION
+    LOCAL_MODULE := libdvm_sv
+    include $(BUILD_SHARED_LIBRARY)
+
+    # Devivation #3
+    # Compile out the JIT
+    WITH_JIT := false
+    include $(LOCAL_PATH)/ReconfigureDvm.mk
+
+    LOCAL_MODULE := libdvm_interp
+    include $(BUILD_SHARED_LIBRARY)
+
+endif
 
 #
 # Build for the host.
@@ -63,21 +96,31 @@ ifeq ($(WITH_HOST_DALVIK),true)
     dvm_arch := $(HOST_ARCH)
     dvm_arch_variant := $(HOST_ARCH_VARIANT)
     dvm_simulator := false
-
+    DEBUG_DALVIK_VM := true
     include $(LOCAL_PATH)/Dvm.mk
 
-    # liblog and libcutils are static for host.
-    LOCAL_STATIC_LIBRARIES += \
-        liblog libcutils
+    # We need to include all of these libraries. The end result of this
+    # section is a static library, but LOCAL_STATIC_LIBRARIES doesn't
+    # actually cause any code from the specified libraries to be included,
+    # whereas LOCAL_WHOLE_STATIC_LIBRARIES does. No, I (danfuzz) am not
+    # entirely sure what LOCAL_STATIC_LIBRARIES is even supposed to mean
+    # in this context, but it is in (apparently) meaningfully used in
+    # other parts of the build.
+    LOCAL_WHOLE_STATIC_LIBRARIES += \
+	libnativehelper-host libdex liblog libcutils
 
-    # libffi is called libffi-host on the host. Similarly libnativehelper.
-    LOCAL_SHARED_LIBRARIES := \
-        $(patsubst libffi,libffi-host,$(LOCAL_SHARED_LIBRARIES))
-    LOCAL_SHARED_LIBRARIES := \
-        $(patsubst libnativehelper,libnativehelper-host,$(LOCAL_SHARED_LIBRARIES))
+    # The libffi from the source tree should never be used by host builds.
+    # The recommendation is that host builds should always either
+    # have sufficient custom code so that libffi isn't needed at all,
+    # or they should use the platform's provided libffi. So, if the common
+    # build rules decided to include it, axe it back out here.
+    ifneq (,$(findstring libffi,$(LOCAL_SHARED_LIBRARIES)))
+        LOCAL_SHARED_LIBRARIES := \
+            $(patsubst libffi, ,$(LOCAL_SHARED_LIBRARIES))
+    endif
 
     LOCAL_MODULE := libdvm-host
 
-    include $(BUILD_HOST_SHARED_LIBRARY)
+    include $(BUILD_HOST_STATIC_LIBRARY)
 
 endif

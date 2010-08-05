@@ -20,10 +20,54 @@
 #define _DALVIK_INTERP_JIT
 
 #include "InterpDefs.h"
-
-#define JIT_PROF_SIZE 512
+#include "mterp/common/jit-config.h"
 
 #define JIT_MAX_TRACE_LEN 100
+
+#if defined (WITH_SELF_VERIFICATION)
+
+#define REG_SPACE 256                /* default size of shadow space */
+#define HEAP_SPACE JIT_MAX_TRACE_LEN /* default size of heap space */
+
+typedef struct ShadowHeap {
+    int addr;
+    int data;
+} ShadowHeap;
+
+typedef struct InstructionTrace {
+    int addr;
+    DecodedInstruction decInsn;
+} InstructionTrace;
+
+typedef struct ShadowSpace {
+    const u2* startPC;          /* starting pc of jitted region */
+    const void* fp;             /* starting fp of jitted region */
+    void* glue;                 /* starting glue of jitted region */
+    SelfVerificationState selfVerificationState;  /* self verification state */
+    const u2* endPC;            /* ending pc of jitted region */
+    void* shadowFP;       /* pointer to fp in shadow space */
+    InterpState interpState;    /* copy of interpState */
+    int* registerSpace;         /* copy of register state */
+    int registerSpaceSize;      /* current size of register space */
+    ShadowHeap heapSpace[HEAP_SPACE]; /* copy of heap space */
+    ShadowHeap* heapSpaceTail;        /* tail pointer to heapSpace */
+    const void* endShadowFP;    /* ending fp in shadow space */
+    InstructionTrace trace[JIT_MAX_TRACE_LEN]; /* opcode trace for debugging */
+    int traceLength;            /* counter for current trace length */
+    const Method* method;       /* starting method of jitted region */
+} ShadowSpace;
+
+/*
+ * Self verification functions.
+ */
+void* dvmSelfVerificationShadowSpaceAlloc(Thread* self);
+void dvmSelfVerificationShadowSpaceFree(Thread* self);
+void* dvmSelfVerificationSaveState(const u2* pc, const void* fp,
+                                   InterpState* interpState,
+                                   int targetTrace);
+void* dvmSelfVerificationRestoreState(const u2* pc, const void* fp,
+                                      SelfVerificationState exitPoint);
+#endif
 
 /*
  * JitTable hash function.
@@ -44,13 +88,13 @@ static inline u4 dvmJitHash( const u2* p ) {
  */
 
 typedef struct JitEntryInfo {
-    unsigned int           traceRequested:1;   /* already requested a translation */
+    unsigned int           traceConstruction:1;   /* build underway? */
     unsigned int           isMethodEntry:1;
     unsigned int           inlineCandidate:1;
     unsigned int           profileEnabled:1;
     JitInstructionSetType  instructionSet:4;
     unsigned int           unused:8;
-    u2                     chain;              /* Index of next in chain */
+    u2                     chain;                 /* Index of next in chain */
 } JitEntryInfo;
 
 typedef union JitEntryInfoUnion {
@@ -59,24 +103,22 @@ typedef union JitEntryInfoUnion {
 } JitEntryInfoUnion;
 
 typedef struct JitEntry {
-    JitEntryInfoUnion u;
-    u2                chain;              /* Index of next in chain */
-    const u2*         dPC;                /* Dalvik code address */
-    void*             codeAddress;        /* Code address of native translation */
+    JitEntryInfoUnion   u;
+    const u2*           dPC;            /* Dalvik code address */
+    void*               codeAddress;    /* Code address of native translation */
 } JitEntry;
 
-int dvmJitStartup(void);
-void dvmJitShutdown(void);
 int dvmCheckJit(const u2* pc, Thread* self, InterpState* interpState);
 void* dvmJitGetCodeAddr(const u2* dPC);
 bool dvmJitCheckTraceRequest(Thread* self, InterpState* interpState);
 void dvmJitStopTranslationRequests(void);
 void dvmJitStats(void);
 bool dvmJitResizeJitTable(unsigned int size);
+void dvmJitResetTable(void);
 struct JitEntry *dvmFindJitEntry(const u2* pc);
 s8 dvmJitd2l(double d);
 s8 dvmJitf2l(float f);
 void dvmJitSetCodeAddr(const u2* dPC, void *nPC, JitInstructionSetType set);
-
+void dvmJitAbortTraceSelect(InterpState* interpState);
 
 #endif /*_DALVIK_INTERP_JIT*/

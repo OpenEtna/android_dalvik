@@ -178,8 +178,8 @@ unspecified registers or condition codes.
 #define SET_VREG(_reg, _vreg)   str     _reg, [rFP, _vreg, lsl #2]
 
 #if defined(WITH_JIT)
-#define GET_JIT_ENABLED(_reg)       ldr     _reg,[rGLUE,#offGlue_jitEnabled]
 #define GET_JIT_PROF_TABLE(_reg)    ldr     _reg,[rGLUE,#offGlue_pJitProfTable]
+#define GET_JIT_THRESHOLD(_reg)     ldr     _reg,[rGLUE,#offGlue_jitThreshold]
 #endif
 
 /*
@@ -194,3 +194,6 @@ unspecified registers or condition codes.
  */
 #include "../common/asm-constants.h"
 
+#if defined(WITH_JIT)
+#include "../common/jit-config.h"
+#endif

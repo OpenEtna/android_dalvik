@@ -92,6 +92,9 @@ unspecified registers or condition codes.
 #define SAVEAREA_FROM_FP(_reg, _fpreg) \
     sub     _reg, _fpreg, #sizeofStackSaveArea
 
+#define EXPORT_PC() \
+    str     rPC, [rFP, #(-sizeofStackSaveArea + offStackSaveArea_currentPc)]
+
 /*
  * This is a #include, not a %include, because we want the C pre-processor
  * to expand the macros into assembler assignment statements.
@@ -102,7 +105,7 @@ unspecified registers or condition codes.
 /* File: armv5te/platform.S */
 /*
  * ===========================================================================
- *  CPU-version-specific defines
+ *  CPU-version-specific defines and utility
  * ===========================================================================
  */
 
@@ -180,27 +183,39 @@ dvmCompiler_TEMPLATE_RETURN:
     ldr     r10, [r0, #offStackSaveArea_prevFrame] @ r10<- saveArea->prevFrame
     ldr     r8, [rGLUE, #offGlue_pSelfSuspendCount] @ r8<- &suspendCount
     ldr     rPC, [r0, #offStackSaveArea_savedPc] @ rPC<- saveArea->savedPc
+#if !defined(WITH_SELF_VERIFICATION)
     ldr     r9,  [r0, #offStackSaveArea_returnAddr] @ r9<- chaining cell ret
+#else
+    mov     r9, #0                      @ disable chaining
+#endif
     ldr     r2, [r10, #(offStackSaveArea_method - sizeofStackSaveArea)]
                                         @ r2<- method we're returning to
     ldr     r3, [rGLUE, #offGlue_self]  @ r3<- glue->self
     cmp     r2, #0                      @ break frame?
+#if !defined(WITH_SELF_VERIFICATION)
     beq     1f                          @ bail to interpreter
-    ldr     r0, .LdvmJitToInterpNoChain @ defined in footer.S
+#else
+    blxeq   lr                          @ punt to interpreter and compare state
+#endif
+    ldr     r1, .LdvmJitToInterpNoChain @ defined in footer.S
     mov     rFP, r10                    @ publish new FP
     ldrne   r10, [r2, #offMethod_clazz] @ r10<- method->clazz
     ldr     r8, [r8]                    @ r8<- suspendCount
 
     str     r2, [rGLUE, #offGlue_method]@ glue->method = newSave->method
-    ldr     r1, [r10, #offClassObject_pDvmDex] @ r1<- method->clazz->pDvmDex
+    ldr     r0, [r10, #offClassObject_pDvmDex] @ r0<- method->clazz->pDvmDex
     str     rFP, [r3, #offThread_curFrame] @ self->curFrame = fp
     add     rPC, rPC, #6                @ publish new rPC (advance 6 bytes)
-    str     r1, [rGLUE, #offGlue_methodClassDex]
+    str     r0, [rGLUE, #offGlue_methodClassDex]
     cmp     r8, #0                      @ check the suspendCount
     movne   r9, #0                      @ clear the chaining cell address
+    str     r9, [r3, #offThread_inJitCodeCache] @ in code cache or not
     cmp     r9, #0                      @ chaining cell exists?
     blxne   r9                          @ jump to the chaining cell
-    mov     pc, r0                      @ callsite is interpreted
+#if defined(JIT_STATS)
+    mov     r0, #kCallsiteInterpreted
+#endif
+    mov     pc, r1                      @ callsite is interpreted
 1:
     stmia   rGLUE, {rPC, rFP}           @ SAVE_PC_FP_TO_GLUE()
     ldr     r2, .LdvmMterpStdBail       @ defined in footer.S
@@ -228,7 +243,7 @@ dvmCompiler_TEMPLATE_INVOKE_METHOD_NO_OPT:
     sub     r1, r1, r7, lsl #2          @ r1<- newFp (old savearea - regsSize)
     SAVEAREA_FROM_FP(r10, r1)           @ r10<- stack save area
     sub     r10, r10, r2, lsl #2        @ r10<- bottom (newsave - outsSize)
-    ldr     r8, [r8]                    @ r3<- suspendCount (int)
+    ldr     r8, [r8]                    @ r8<- suspendCount (int)
     cmp     r10, r9                     @ bottom < interpStackEnd?
     bxlt    lr                          @ return to raise stack overflow excep.
     @ r1 = newFP, r0 = methodToCall, r3 = returnCell, rPC = dalvikCallsite
@@ -246,9 +261,13 @@ dvmCompiler_TEMPLATE_INVOKE_METHOD_NO_OPT:
     cmp     r8, #0                      @ suspendCount != 0
     bxne    lr                          @ bail to the interpreter
     tst     r10, #ACC_NATIVE
+#if !defined(WITH_SELF_VERIFICATION)
     bne     .LinvokeNative
+#else
+    bxne    lr                          @ bail to the interpreter
+#endif
 
-    ldr     r10, .LdvmJitToInterpNoChain
+    ldr     r10, .LdvmJitToInterpTraceSelectNoChain
     ldr     r3, [r9, #offClassObject_pDvmDex] @ r3<- method->clazz->pDvmDex
     ldr     r2, [rGLUE, #offGlue_self]      @ r2<- glue->self
 
@@ -259,7 +278,10 @@ dvmCompiler_TEMPLATE_INVOKE_METHOD_NO_OPT:
     str     rFP, [r2, #offThread_curFrame]  @ self->curFrame = newFp
 
     @ Start executing the callee
-    mov     pc, r10                         @ dvmJitToInterpNoChain
+#if defined(JIT_STATS)
+    mov     r0, #kInlineCacheMiss
+#endif
+    mov     pc, r10                         @ dvmJitToInterpTraceSelectNoChain
 
 /* ------------------------------ */
     .balign 4
@@ -284,7 +306,7 @@ dvmCompiler_TEMPLATE_INVOKE_METHOD_CHAIN:
     SAVEAREA_FROM_FP(r10, r1)           @ r10<- stack save area
     add     r12, lr, #2                 @ setup the punt-to-interp address
     sub     r10, r10, r2, lsl #2        @ r10<- bottom (newsave - outsSize)
-    ldr     r8, [r8]                    @ r3<- suspendCount (int)
+    ldr     r8, [r8]                    @ r8<- suspendCount (int)
     cmp     r10, r9                     @ bottom < interpStackEnd?
     bxlt    r12                         @ return to raise stack overflow excep.
     @ r1 = newFP, r0 = methodToCall, r3 = returnCell, rPC = dalvikCallsite
@@ -391,11 +413,17 @@ dvmCompiler_TEMPLATE_INVOKE_METHOD_NATIVE:
     str     r0, [r1, #(offStackSaveArea_method - sizeofStackSaveArea)]
     cmp     r8, #0                      @ suspendCount != 0
     ldr     r8, [r0, #offMethod_nativeFunc] @ r8<- method->nativeFunc
+#if !defined(WITH_SELF_VERIFICATION)
     bxne    lr                          @ bail to the interpreter
+#else
+    bx      lr                          @ bail to interpreter unconditionally
+#endif
 
     @ go ahead and transfer control to the native code
     ldr     r9, [r3, #offThread_jniLocal_topCookie] @ r9<- thread->localRef->...
+    mov     r2, #0
     str     r1, [r3, #offThread_curFrame]   @ self->curFrame = newFp
+    str     r2, [r3, #offThread_inJitCodeCache] @ not in the jit code cache
     str     r9, [r1, #(offStackSaveArea_localRefCookie - sizeofStackSaveArea)]
                                         @ newFp->localRefCookie=top
     mov     r9, r3                      @ r9<- glue->self (preserve)
@@ -415,8 +443,24 @@ dvmCompiler_TEMPLATE_INVOKE_METHOD_NATIVE:
     str     rFP, [r9, #offThread_curFrame]  @ self->curFrame = fp
     cmp     r1, #0                      @ null?
     str     r0, [r9, #offThread_jniLocal_topCookie] @ new top <- old top
-    bne     .LhandleException             @ no, handle exception
-    bx      r2
+    ldr     r0, [rFP, #(offStackSaveArea_currentPc - sizeofStackSaveArea)]
+
+    @ r0 = dalvikCallsitePC
+    bne     .LhandleException           @ no, handle exception
+
+    str     r2, [r9, #offThread_inJitCodeCache] @ set the mode properly
+    cmp     r2, #0                      @ return chaining cell still exists?
+    bxne    r2                          @ yes - go ahead
+
+    @ continue executing the next instruction through the interpreter
+    ldr     r1, .LdvmJitToInterpTraceSelectNoChain @ defined in footer.S
+    add     rPC, r0, #6                 @ reconstruct new rPC (advance 6 bytes)
+#if defined(JIT_STATS)
+    mov     r0, #kCallsiteInterpreted
+#endif
+    mov     pc, r1
+
+
 
 
 /* ------------------------------ */
@@ -426,7 +470,7 @@ dvmCompiler_TEMPLATE_CMPG_DOUBLE:
 /* File: armv5te/TEMPLATE_CMPG_DOUBLE.S */
 /* File: armv5te/TEMPLATE_CMPL_DOUBLE.S */
     /*
-     * For the JIT: incoming arguments are pointers to the arguments in r0/r1
+     * For the JIT: incoming arguments in r0-r1, r2-r3
      *              result in r0
      *
      * Compare two floating-point values.  Puts 0, 1, or -1 into the
@@ -440,28 +484,26 @@ dvmCompiler_TEMPLATE_CMPG_DOUBLE:
      * For: cmpl-double, cmpg-double
      */
     /* op vAA, vBB, vCC */
-    mov     r4, lr                      @ save return address
-    mov     r9, r0                      @ save copy of &arg1
-    mov     r10, r1                     @ save copy of &arg2
-    ldmia   r9, {r0-r1}                 @ r0/r1<- vBB/vBB+1
-    ldmia   r10, {r2-r3}                @ r2/r3<- vCC/vCC+1
+    push    {r0-r3}                     @ save operands
+    mov     r11, lr                     @ save return address
     LDR_PC_LR ".L__aeabi_cdcmple"       @ PIC way of "bl __aeabi_cdcmple"
     bhi     .LTEMPLATE_CMPG_DOUBLE_gt_or_nan       @ C set and Z clear, disambiguate
     mvncc   r0, #0                      @ (less than) r1<- -1
     moveq   r0, #0                      @ (equal) r1<- 0, trumps less than
-    bx      r4
+    add     sp, #16                     @ drop unused operands
+    bx      r11
 
     @ Test for NaN with a second comparison.  EABI forbids testing bit
     @ patterns, and we can't represent 0x7fc00000 in immediate form, so
     @ make the library call.
 .LTEMPLATE_CMPG_DOUBLE_gt_or_nan:
-    ldmia   r10, {r0-r1}                @ reverse order
-    ldmia   r9, {r2-r3}
+    pop     {r2-r3}                     @ restore operands in reverse order
+    pop     {r0-r1}                     @ restore operands in reverse order
     LDR_PC_LR ".L__aeabi_cdcmple"       @ r0<- Z set if eq, C clear if <
     movcc   r0, #1                      @ (greater than) r1<- 1
-    bxcc    r4
+    bxcc    r11
     mov     r0, #1                            @ r1<- 1 or -1 for NaN
-    bx      r4
+    bx      r11
 
 
 
@@ -471,7 +513,7 @@ dvmCompiler_TEMPLATE_CMPG_DOUBLE:
 dvmCompiler_TEMPLATE_CMPL_DOUBLE:
 /* File: armv5te/TEMPLATE_CMPL_DOUBLE.S */
     /*
-     * For the JIT: incoming arguments are pointers to the arguments in r0/r1
+     * For the JIT: incoming arguments in r0-r1, r2-r3
      *              result in r0
      *
      * Compare two floating-point values.  Puts 0, 1, or -1 into the
@@ -485,28 +527,26 @@ dvmCompiler_TEMPLATE_CMPL_DOUBLE:
      * For: cmpl-double, cmpg-double
      */
     /* op vAA, vBB, vCC */
-    mov     r4, lr                      @ save return address
-    mov     r9, r0                      @ save copy of &arg1
-    mov     r10, r1                     @ save copy of &arg2
-    ldmia   r9, {r0-r1}                 @ r0/r1<- vBB/vBB+1
-    ldmia   r10, {r2-r3}                @ r2/r3<- vCC/vCC+1
+    push    {r0-r3}                     @ save operands
+    mov     r11, lr                     @ save return address
     LDR_PC_LR ".L__aeabi_cdcmple"       @ PIC way of "bl __aeabi_cdcmple"
     bhi     .LTEMPLATE_CMPL_DOUBLE_gt_or_nan       @ C set and Z clear, disambiguate
     mvncc   r0, #0                      @ (less than) r1<- -1
     moveq   r0, #0                      @ (equal) r1<- 0, trumps less than
-    bx      r4
+    add     sp, #16                     @ drop unused operands
+    bx      r11
 
     @ Test for NaN with a second comparison.  EABI forbids testing bit
     @ patterns, and we can't represent 0x7fc00000 in immediate form, so
     @ make the library call.
 .LTEMPLATE_CMPL_DOUBLE_gt_or_nan:
-    ldmia   r10, {r0-r1}                @ reverse order
-    ldmia   r9, {r2-r3}
+    pop     {r2-r3}                     @ restore operands in reverse order
+    pop     {r0-r1}                     @ restore operands in reverse order
     LDR_PC_LR ".L__aeabi_cdcmple"       @ r0<- Z set if eq, C clear if <
     movcc   r0, #1                      @ (greater than) r1<- 1
-    bxcc    r4
+    bxcc    r11
     mvn     r0, #0                            @ r1<- 1 or -1 for NaN
-    bx      r4
+    bx      r11
 
 
 /* ------------------------------ */
@@ -516,7 +556,7 @@ dvmCompiler_TEMPLATE_CMPG_FLOAT:
 /* File: armv5te/TEMPLATE_CMPG_FLOAT.S */
 /* File: armv5te/TEMPLATE_CMPL_FLOAT.S */
     /*
-     * For the JIT: incoming arguments in r0, r1
+     * For the JIT: incoming arguments in r0-r1, r2-r3
      *              result in r0
      *
      * Compare two floating-point values.  Puts 0, 1, or -1 into the
@@ -549,25 +589,25 @@ dvmCompiler_TEMPLATE_CMPG_FLOAT:
      * for: cmpl-float, cmpg-float
      */
     /* op vAA, vBB, vCC */
-    mov     r4, lr                      @ save return address
     mov     r9, r0                      @ Save copies - we may need to redo
     mov     r10, r1
+    mov     r11, lr                     @ save return address
     LDR_PC_LR ".L__aeabi_cfcmple"       @ cmp <=: C clear if <, Z set if eq
     bhi     .LTEMPLATE_CMPG_FLOAT_gt_or_nan       @ C set and Z clear, disambiguate
     mvncc   r0, #0                      @ (less than) r0<- -1
     moveq   r0, #0                      @ (equal) r0<- 0, trumps less than
-    bx      r4
+    bx      r11
     @ Test for NaN with a second comparison.  EABI forbids testing bit
     @ patterns, and we can't represent 0x7fc00000 in immediate form, so
     @ make the library call.
 .LTEMPLATE_CMPG_FLOAT_gt_or_nan:
-    mov     r1, r9                      @ reverse order
-    mov     r0, r10
+    mov     r0, r10                     @ restore in reverse order
+    mov     r1, r9
     LDR_PC_LR ".L__aeabi_cfcmple"       @ r0<- Z set if eq, C clear if <
     movcc   r0, #1                      @ (greater than) r1<- 1
-    bxcc    r4
+    bxcc    r11
     mov     r0, #1                            @ r1<- 1 or -1 for NaN
-    bx      r4
+    bx      r11
 
 
 
@@ -578,7 +618,7 @@ dvmCompiler_TEMPLATE_CMPG_FLOAT:
 dvmCompiler_TEMPLATE_CMPL_FLOAT:
 /* File: armv5te/TEMPLATE_CMPL_FLOAT.S */
     /*
-     * For the JIT: incoming arguments in r0, r1
+     * For the JIT: incoming arguments in r0-r1, r2-r3
      *              result in r0
      *
      * Compare two floating-point values.  Puts 0, 1, or -1 into the
@@ -611,25 +651,25 @@ dvmCompiler_TEMPLATE_CMPL_FLOAT:
      * for: cmpl-float, cmpg-float
      */
     /* op vAA, vBB, vCC */
-    mov     r4, lr                      @ save return address
     mov     r9, r0                      @ Save copies - we may need to redo
     mov     r10, r1
+    mov     r11, lr                     @ save return address
     LDR_PC_LR ".L__aeabi_cfcmple"       @ cmp <=: C clear if <, Z set if eq
     bhi     .LTEMPLATE_CMPL_FLOAT_gt_or_nan       @ C set and Z clear, disambiguate
     mvncc   r0, #0                      @ (less than) r0<- -1
     moveq   r0, #0                      @ (equal) r0<- 0, trumps less than
-    bx      r4
+    bx      r11
     @ Test for NaN with a second comparison.  EABI forbids testing bit
     @ patterns, and we can't represent 0x7fc00000 in immediate form, so
     @ make the library call.
 .LTEMPLATE_CMPL_FLOAT_gt_or_nan:
-    mov     r1, r9                      @ reverse order
-    mov     r0, r10
+    mov     r0, r10                     @ restore in reverse order
+    mov     r1, r9
     LDR_PC_LR ".L__aeabi_cfcmple"       @ r0<- Z set if eq, C clear if <
     movcc   r0, #1                      @ (greater than) r1<- 1
-    bxcc    r4
+    bxcc    r11
     mvn     r0, #0                            @ r1<- 1 or -1 for NaN
-    bx      r4
+    bx      r11
 
 
 
@@ -732,6 +772,399 @@ dvmCompiler_TEMPLATE_USHR_LONG:
     bx      lr
 
 
+/* ------------------------------ */
+    .balign 4
+    .global dvmCompiler_TEMPLATE_THROW_EXCEPTION_COMMON
+dvmCompiler_TEMPLATE_THROW_EXCEPTION_COMMON:
+/* File: armv5te/TEMPLATE_THROW_EXCEPTION_COMMON.S */
+    /*
+     * Throw an exception from JIT'ed code.
+     * On entry:
+     *    r0    Dalvik PC that raises the exception
+     */
+    b       .LhandleException
+
+/* ------------------------------ */
+    .balign 4
+    .global dvmCompiler_TEMPLATE_MEM_OP_DECODE
+dvmCompiler_TEMPLATE_MEM_OP_DECODE:
+/* File: armv5te/TEMPLATE_MEM_OP_DECODE.S */
+#if defined(WITH_SELF_VERIFICATION)
+    /*
+     * This handler encapsulates heap memory ops for selfVerification mode.
+     *
+     * The call to the handler is inserted prior to a heap memory operation.
+     * This handler then calls a function to decode the memory op, and process
+     * it accordingly. Afterwards, the handler changes the return address to
+     * skip the memory op so it never gets executed.
+     */
+    push    {r0-r12,lr}                 @ save out all registers
+    mov     r0, lr                      @ arg0 <- link register
+    mov     r1, sp                      @ arg1 <- stack pointer
+    ldr     r2, .LdvmSelfVerificationMemOpDecode @ defined in footer.S
+    blx     r2                          @ decode and handle the mem op
+    pop     {r0-r12,lr}                 @ restore all registers
+    bx      lr                          @ return to compiled code
+#endif
+
+/* ------------------------------ */
+    .balign 4
+    .global dvmCompiler_TEMPLATE_STRING_COMPARETO
+dvmCompiler_TEMPLATE_STRING_COMPARETO:
+/* File: armv5te/TEMPLATE_STRING_COMPARETO.S */
+    /*
+     * String's compareTo.
+     *
+     * Requires r0/r1 to have been previously checked for null.  Will
+     * return negative if this's string is < comp, 0 if they are the
+     * same and positive if >.
+     *
+     * IMPORTANT NOTE:
+     *
+     * This code relies on hard-coded offsets for string objects, and must be
+     * kept in sync with definitions in UtfString.h.  See asm-constants.h
+     *
+     * On entry:
+     *    r0:   this object pointer
+     *    r1:   comp object pointer
+     *
+     */
+
+    mov    r2, r0         @ this to r2, opening up r0 for return value
+    subs   r0, r2, r1     @ Same?
+    bxeq   lr
+
+    ldr    r4, [r2, #STRING_FIELDOFF_OFFSET]
+    ldr    r9, [r1, #STRING_FIELDOFF_OFFSET]
+    ldr    r7, [r2, #STRING_FIELDOFF_COUNT]
+    ldr    r10, [r1, #STRING_FIELDOFF_COUNT]
+    ldr    r2, [r2, #STRING_FIELDOFF_VALUE]
+    ldr    r1, [r1, #STRING_FIELDOFF_VALUE]
+
+    /*
+     * At this point, we have:
+     *    value:  r2/r1
+     *    offset: r4/r9
+     *    count:  r7/r10
+     * We're going to compute
+     *    r11 <- countDiff
+     *    r10 <- minCount
+     */
+     subs  r11, r7, r10
+     movls r10, r7
+
+     /* Now, build pointers to the string data */
+     add   r2, r2, r4, lsl #1
+     add   r1, r1, r9, lsl #1
+     /*
+      * Note: data pointers point to previous element so we can use pre-index
+      * mode with base writeback.
+      */
+     add   r2, #16-2   @ offset to contents[-1]
+     add   r1, #16-2   @ offset to contents[-1]
+
+     /*
+      * At this point we have:
+      *   r2: *this string data
+      *   r1: *comp string data
+      *   r10: iteration count for comparison
+      *   r11: value to return if the first part of the string is equal
+      *   r0: reserved for result
+      *   r3, r4, r7, r8, r9, r12 available for loading string data
+      */
+
+    subs  r10, #2
+    blt   do_remainder2
+
+      /*
+       * Unroll the first two checks so we can quickly catch early mismatch
+       * on long strings (but preserve incoming alignment)
+       */
+
+    ldrh  r3, [r2, #2]!
+    ldrh  r4, [r1, #2]!
+    ldrh  r7, [r2, #2]!
+    ldrh  r8, [r1, #2]!
+    subs  r0, r3, r4
+    subeqs  r0, r7, r8
+    bxne  lr
+    cmp   r10, #28
+    bgt   do_memcmp16
+    subs  r10, #3
+    blt   do_remainder
+
+loopback_triple:
+    ldrh  r3, [r2, #2]!
+    ldrh  r4, [r1, #2]!
+    ldrh  r7, [r2, #2]!
+    ldrh  r8, [r1, #2]!
+    ldrh  r9, [r2, #2]!
+    ldrh  r12,[r1, #2]!
+    subs  r0, r3, r4
+    subeqs  r0, r7, r8
+    subeqs  r0, r9, r12
+    bxne  lr
+    subs  r10, #3
+    bge   loopback_triple
+
+do_remainder:
+    adds  r10, #3
+    beq   returnDiff
+
+loopback_single:
+    ldrh  r3, [r2, #2]!
+    ldrh  r4, [r1, #2]!
+    subs  r0, r3, r4
+    bxne  lr
+    subs  r10, #1
+    bne     loopback_single
+
+returnDiff:
+    mov   r0, r11
+    bx    lr
+
+do_remainder2:
+    adds  r10, #2
+    bne   loopback_single
+    mov   r0, r11
+    bx    lr
+
+    /* Long string case */
+do_memcmp16:
+    mov   r4, lr
+    ldr   lr, .Lmemcmp16
+    mov   r7, r11
+    add   r0, r2, #2
+    add   r1, r1, #2
+    mov   r2, r10
+    blx   lr
+    cmp   r0, #0
+    bxne  r4
+    mov   r0, r7
+    bx    r4
+
+.Lmemcmp16:
+    .word __memcmp16
+
+
+/* ------------------------------ */
+    .balign 4
+    .global dvmCompiler_TEMPLATE_STRING_INDEXOF
+dvmCompiler_TEMPLATE_STRING_INDEXOF:
+/* File: armv5te/TEMPLATE_STRING_INDEXOF.S */
+    /*
+     * String's indexOf.
+     *
+     * Requires r0 to have been previously checked for null.  Will
+     * return index of match of r1 in r0.
+     *
+     * IMPORTANT NOTE:
+     *
+     * This code relies on hard-coded offsets for string objects, and must be
+     * kept in sync wth definitions in UtfString.h  See asm-constants.h
+     *
+     * On entry:
+     *    r0:   string object pointer
+     *    r1:   char to match
+     *    r2:   Starting offset in string data
+     */
+
+    ldr    r7, [r0, #STRING_FIELDOFF_OFFSET]
+    ldr    r8, [r0, #STRING_FIELDOFF_COUNT]
+    ldr    r0, [r0, #STRING_FIELDOFF_VALUE]
+
+    /*
+     * At this point, we have:
+     *    r0: object pointer
+     *    r1: char to match
+     *    r2: starting offset
+     *    r7: offset
+     *    r8: string length
+     */
+
+     /* Build pointer to start of string data */
+     add   r0, #16
+     add   r0, r0, r7, lsl #1
+
+     /* Save a copy of starting data in r7 */
+     mov   r7, r0
+
+     /* Clamp start to [0..count] */
+     cmp   r2, #0
+     movlt r2, #0
+     cmp   r2, r8
+     movgt r2, r8
+
+     /* Build pointer to start of data to compare and pre-bias */
+     add   r0, r0, r2, lsl #1
+     sub   r0, #2
+
+     /* Compute iteration count */
+     sub   r8, r2
+
+     /*
+      * At this point we have:
+      *   r0: start of data to test
+      *   r1: chat to compare
+      *   r8: iteration count
+      *   r7: original start of string
+      *   r3, r4, r9, r10, r11, r12 available for loading string data
+      */
+
+    subs  r8, #4
+    blt   indexof_remainder
+
+indexof_loop4:
+    ldrh  r3, [r0, #2]!
+    ldrh  r4, [r0, #2]!
+    ldrh  r10, [r0, #2]!
+    ldrh  r11, [r0, #2]!
+    cmp   r3, r1
+    beq   match_0
+    cmp   r4, r1
+    beq   match_1
+    cmp   r10, r1
+    beq   match_2
+    cmp   r11, r1
+    beq   match_3
+    subs  r8, #4
+    bge   indexof_loop4
+
+indexof_remainder:
+    adds    r8, #4
+    beq     indexof_nomatch
+
+indexof_loop1:
+    ldrh  r3, [r0, #2]!
+    cmp   r3, r1
+    beq   match_3
+    subs  r8, #1
+    bne   indexof_loop1
+
+indexof_nomatch:
+    mov   r0, #-1
+    bx    lr
+
+match_0:
+    sub   r0, #6
+    sub   r0, r7
+    asr   r0, r0, #1
+    bx    lr
+match_1:
+    sub   r0, #4
+    sub   r0, r7
+    asr   r0, r0, #1
+    bx    lr
+match_2:
+    sub   r0, #2
+    sub   r0, r7
+    asr   r0, r0, #1
+    bx    lr
+match_3:
+    sub   r0, r7
+    asr   r0, r0, #1
+    bx    lr
+
+
+/* ------------------------------ */
+    .balign 4
+    .global dvmCompiler_TEMPLATE_INTERPRET
+dvmCompiler_TEMPLATE_INTERPRET:
+/* File: armv5te/TEMPLATE_INTERPRET.S */
+    /*
+     * This handler transfers control to the interpeter without performing
+     * any lookups.  It may be called either as part of a normal chaining
+     * operation, or from the transition code in header.S.  We distinquish
+     * the two cases by looking at the link register.  If called from a
+     * translation chain, it will point to the chaining Dalvik PC + 1.
+     * On entry:
+     *    lr - if NULL:
+     *        r1 - the Dalvik PC to begin interpretation.
+     *    else
+     *        [lr, #-1] contains Dalvik PC to begin interpretation
+     *    rGLUE - pointer to interpState
+     *    rFP - Dalvik frame pointer
+     */
+    cmp     lr, #0
+    ldrne   r1,[lr, #-1]
+    ldr     r2, .LinterpPunt
+    mov     r0, r1                       @ set Dalvik PC
+    bx      r2
+    @ doesn't return
+
+.LinterpPunt:
+    .word   dvmJitToInterpPunt
+
+/* ------------------------------ */
+    .balign 4
+    .global dvmCompiler_TEMPLATE_MONITOR_ENTER
+dvmCompiler_TEMPLATE_MONITOR_ENTER:
+/* File: armv5te/TEMPLATE_MONITOR_ENTER.S */
+    /*
+     * Call out to the runtime to lock an object.  Because this thread
+     * may have been suspended in THREAD_MONITOR state and the Jit's
+     * translation cache subsequently cleared, we cannot return directly.
+     * Instead, unconditionally transition to the interpreter to resume.
+     *
+     * On entry:
+     *    r0 - self pointer
+     *    r1 - the object (which has already been null-checked by the caller
+     *    r4 - the Dalvik PC of the following instruction.
+     */
+    ldr     r2, .LdvmLockObject
+    mov     r3, #0                       @ Record that we're not returning
+    str     r3, [r0, #offThread_inJitCodeCache]
+    blx     r2                           @ dvmLockObject(self, obj)
+    @ refresh Jit's on/off status
+    ldr     r0, [rGLUE, #offGlue_ppJitProfTable]
+    ldr     r0, [r0]
+    ldr     r2, .LdvmJitToInterpNoChain
+    str     r0, [rGLUE, #offGlue_pJitProfTable]
+    @ Bail to interpreter - no chain [note - r4 still contains rPC]
+#if defined(JIT_STATS)
+    mov     r0, #kHeavyweightMonitor
+#endif
+    bx      r2
+
+
+/* ------------------------------ */
+    .balign 4
+    .global dvmCompiler_TEMPLATE_MONITOR_ENTER_DEBUG
+dvmCompiler_TEMPLATE_MONITOR_ENTER_DEBUG:
+/* File: armv5te/TEMPLATE_MONITOR_ENTER_DEBUG.S */
+    /*
+     * To support deadlock prediction, this version of MONITOR_ENTER
+     * will always call the heavyweight dvmLockObject, check for an
+     * exception and then bail out to the interpreter.
+     *
+     * On entry:
+     *    r0 - self pointer
+     *    r1 - the object (which has already been null-checked by the caller
+     *    r4 - the Dalvik PC of the following instruction.
+     *
+     */
+    ldr     r2, .LdvmLockObject
+    mov     r3, #0                       @ Record that we're not returning
+    str     r3, [r0, #offThread_inJitCodeCache]
+    blx     r2             @ dvmLockObject(self, obj)
+    @ refresh Jit's on/off status & test for exception
+    ldr     r0, [rGLUE, #offGlue_ppJitProfTable]
+    ldr     r1, [rGLUE, #offGlue_self]
+    ldr     r0, [r0]
+    ldr     r1, [r1, #offThread_exception]
+    str     r0, [rGLUE, #offGlue_pJitProfTable]
+    cmp     r1, #0
+    beq     1f
+    ldr     r2, .LhandleException
+    sub     r0, r4, #2     @ roll dPC back to this monitor instruction
+    bx      r2
+1:
+    @ Bail to interpreter - no chain [note - r4 still contains rPC]
+#if defined(JIT_STATS)
+    mov     r0, #kHeavyweightMonitor
+#endif
+    ldr     pc, .LdvmJitToInterpNoChain
+
     .size   dvmCompilerTemplateStart, .-dvmCompilerTemplateStart
 /* File: armv5te/footer.S */
 /*
@@ -746,7 +1179,9 @@ dvmCompiler_TEMPLATE_USHR_LONG:
     @ Prep for the native call
     @ r1 = newFP, r0 = methodToCall
     ldr     r3, [rGLUE, #offGlue_self]      @ r3<- glue->self
+    mov     r2, #0
     ldr     r9, [r3, #offThread_jniLocal_topCookie] @ r9<- thread->localRef->...
+    str     r2, [r3, #offThread_inJitCodeCache] @ not in jit code cache
     str     r1, [r3, #offThread_curFrame]   @ self->curFrame = newFp
     str     r9, [r1, #(offStackSaveArea_localRefCookie - sizeofStackSaveArea)]
                                         @ newFp->localRefCookie=top
@@ -759,33 +1194,71 @@ dvmCompiler_TEMPLATE_USHR_LONG:
 
     LDR_PC_LR "[r2, #offMethod_nativeFunc]"
 
+    @ Refresh Jit's on/off status
+    ldr     r3, [rGLUE, #offGlue_ppJitProfTable]
+
     @ native return; r9=self, r10=newSaveArea
     @ equivalent to dvmPopJniLocals
     ldr     r2, [r10, #offStackSaveArea_returnAddr] @ r2 = chaining cell ret
     ldr     r0, [r10, #offStackSaveArea_localRefCookie] @ r0<- saved->top
     ldr     r1, [r9, #offThread_exception] @ check for exception
+    ldr     r3, [r3]    @ r1 <- pointer to Jit profile table
     str     rFP, [r9, #offThread_curFrame]  @ self->curFrame = fp
     cmp     r1, #0                      @ null?
     str     r0, [r9, #offThread_jniLocal_topCookie] @ new top <- old top
-    bne     .LhandleException             @ no, handle exception
-    bx      r2
+    ldr     r0, [r10, #offStackSaveArea_savedPc] @ reload rPC
+    str     r3, [rGLUE, #offGlue_pJitProfTable]  @ cache current JitProfTable
 
-/* NOTE - this path can be exercised if the JIT threshold is set to 5 */
+    @ r0 = dalvikCallsitePC
+    bne     .LhandleException           @ no, handle exception
+
+    str     r2, [r9, #offThread_inJitCodeCache] @ set the new mode
+    cmp     r2, #0                      @ return chaining cell still exists?
+    bxne    r2                          @ yes - go ahead
+
+    @ continue executing the next instruction through the interpreter
+    ldr     r1, .LdvmJitToInterpTraceSelectNoChain @ defined in footer.S
+    add     rPC, r0, #6                 @ reconstruct new rPC (advance 6 bytes)
+#if defined(JIT_STATS)
+    mov     r0, #kCallsiteInterpreted
+#endif
+    mov     pc, r1
+
+/*
+ * On entry:
+ * r0  Faulting Dalvik PC
+ */
 .LhandleException:
-    ldr     r0, .LdvmMterpCommonExceptionThrown @ PIC way of getting &func
+#if defined(WITH_SELF_VERIFICATION)
+    ldr     pc, .LdeadFood @ should not see this under self-verification mode
+.LdeadFood:
+    .word   0xdeadf00d
+#endif
+    ldr     r3, [rGLUE, #offGlue_self]  @ r3<- glue->self
+    mov     r2, #0
+    str     r2, [r3, #offThread_inJitCodeCache] @ in interpreter land
+    ldr     r1, .LdvmMterpCommonExceptionThrown @ PIC way of getting &func
     ldr     rIBASE, .LdvmAsmInstructionStart    @ same as above
-    ldr     rPC, [r10, #offStackSaveArea_savedPc] @ reload rPC
-    mov     pc, r0                  @ branch to dvmMterpCommonExceptionThrown
+    mov     rPC, r0                 @ reload the faulting Dalvik address
+    mov     pc, r1                  @ branch to dvmMterpCommonExceptionThrown
 
     .align  2
 .LdvmAsmInstructionStart:
     .word   dvmAsmInstructionStart
+.LdvmJitToInterpTraceSelectNoChain:
+    .word   dvmJitToInterpTraceSelectNoChain
 .LdvmJitToInterpNoChain:
     .word   dvmJitToInterpNoChain
 .LdvmMterpStdBail:
     .word   dvmMterpStdBail
 .LdvmMterpCommonExceptionThrown:
     .word   dvmMterpCommonExceptionThrown
+.LdvmLockObject:
+    .word   dvmLockObject
+#if defined(WITH_SELF_VERIFICATION)
+.LdvmSelfVerificationMemOpDecode:
+    .word   dvmSelfVerificationMemOpDecode
+#endif
 .L__aeabi_cdcmple:
     .word   __aeabi_cdcmple
 .L__aeabi_cfcmple:

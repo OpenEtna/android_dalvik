@@ -13,7 +13,7 @@
     sub     r1, r1, r7, lsl #2          @ r1<- newFp (old savearea - regsSize)
     SAVEAREA_FROM_FP(r10, r1)           @ r10<- stack save area
     sub     r10, r10, r2, lsl #2        @ r10<- bottom (newsave - outsSize)
-    ldr     r8, [r8]                    @ r3<- suspendCount (int)
+    ldr     r8, [r8]                    @ r8<- suspendCount (int)
     cmp     r10, r9                     @ bottom < interpStackEnd?
     bxlt    lr                          @ return to raise stack overflow excep.
     @ r1 = newFP, r0 = methodToCall, r3 = returnCell, rPC = dalvikCallsite
@@ -31,9 +31,13 @@
     cmp     r8, #0                      @ suspendCount != 0
     bxne    lr                          @ bail to the interpreter
     tst     r10, #ACC_NATIVE
+#if !defined(WITH_SELF_VERIFICATION)
     bne     .LinvokeNative
+#else
+    bxne    lr                          @ bail to the interpreter
+#endif
 
-    ldr     r10, .LdvmJitToInterpNoChain
+    ldr     r10, .LdvmJitToInterpTraceSelectNoChain
     ldr     r3, [r9, #offClassObject_pDvmDex] @ r3<- method->clazz->pDvmDex
     ldr     r2, [rGLUE, #offGlue_self]      @ r2<- glue->self
 
@@ -44,4 +48,7 @@
     str     rFP, [r2, #offThread_curFrame]  @ self->curFrame = newFp
 
     @ Start executing the callee
-    mov     pc, r10                         @ dvmJitToInterpNoChain
+#if defined(JIT_STATS)
+    mov     r0, #kInlineCacheMiss
+#endif
+    mov     pc, r10                         @ dvmJitToInterpTraceSelectNoChain

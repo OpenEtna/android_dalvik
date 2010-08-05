@@ -68,16 +68,8 @@
 #define LOGV_SWEEP(...) LOGVV_GC("SWEEP: " __VA_ARGS__)
 #define LOGV_REF(...)   LOGVV_GC("REF: " __VA_ARGS__)
 
-#if WITH_OBJECT_HEADERS
-u2 gGeneration = 0;
-static const Object *gMarkParent = NULL;
-#endif
-
-#ifndef PAGE_SIZE
-#define PAGE_SIZE 4096
-#endif
 #define ALIGN_UP_TO_PAGE_SIZE(p) \
-    (((size_t)(p) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
+    (((size_t)(p) + (SYSTEM_PAGE_SIZE - 1)) & ~(SYSTEM_PAGE_SIZE - 1))
 
 /* Do not cast the result of this to a boolean; the only set bit
  * may be > 1<<8.
@@ -154,7 +146,7 @@ dvmHeapBeginMarkStep()
 
     numBitmaps = dvmHeapSourceGetObjectBitmaps(objectBitmaps,
             HEAP_SOURCE_MAX_HEAP_COUNT);
-    if (numBitmaps <= 0) {
+    if (numBitmaps == 0) {
         return false;
     }
 
@@ -169,10 +161,6 @@ dvmHeapBeginMarkStep()
 
     mc->numBitmaps = numBitmaps;
     mc->finger = NULL;
-
-#if WITH_OBJECT_HEADERS
-    gGeneration++;
-#endif
 
     return true;
 }
@@ -213,28 +201,6 @@ _markObjectNonNullCommon(const Object *obj, GcMarkContext *ctx,
             MARK_STACK_PUSH(ctx->stack, obj);
         }
 
-#if WITH_OBJECT_HEADERS
-        if (hc->scanGeneration != hc->markGeneration) {
-            LOGE("markObject(0x%08x): wasn't scanned last time\n", (uint)obj);
-            dvmAbort();
-        }
-        if (hc->markGeneration == gGeneration) {
-            LOGE("markObject(0x%08x): already marked this generation\n",
-                    (uint)obj);
-            dvmAbort();
-        }
-        hc->oldMarkGeneration = hc->markGeneration;
-        hc->markGeneration = gGeneration;
-        hc->markFingerOld = hc->markFinger;
-        hc->markFinger = ctx->finger;
-        if (gMarkParent != NULL) {
-            hc->parentOld = hc->parent;
-            hc->parent = gMarkParent;
-        } else {
-            hc->parent = (const Object *)((uintptr_t)hc->parent | 1);
-        }
-        hc->markCount++;
-#endif
 #if WITH_HPROF
         if (gDvm.gcHeap->hprofContext != NULL) {
             hprofMarkRootObject(gDvm.gcHeap->hprofContext, obj, 0);
@@ -380,6 +346,7 @@ void dvmHeapMarkRootSet()
     dvmMarkObjectNonNull(gDvm.outOfMemoryObj);
     dvmMarkObjectNonNull(gDvm.internalErrorObj);
     dvmMarkObjectNonNull(gDvm.noClassDefFoundErrorObj);
+    dvmMarkObject(gDvm.jniWeakGlobalRefQueue);
 //TODO: scan object references sitting in gDvm;  use pointer begin & end
 
     HPROF_CLEAR_GC_SCAN_STATE();
@@ -436,7 +403,7 @@ static void scanStaticFields(const ClassObject *clazz, GcMarkContext *ctx)
 static void scanInstanceFields(const DataObject *obj, ClassObject *clazz,
         GcMarkContext *ctx)
 {
-    if (false && clazz->refOffsets != CLASS_WALK_SUPER) {
+    if (clazz->refOffsets != CLASS_WALK_SUPER) {
         unsigned int refOffsets = clazz->refOffsets;
         while (refOffsets != 0) {
             const int rshift = CLZ(refOffsets);
@@ -535,17 +502,6 @@ static void scanObject(const Object *obj, GcMarkContext *ctx)
     }
 #endif
 
-#if WITH_OBJECT_HEADERS
-    if (ptr2chunk(obj)->scanGeneration == gGeneration) {
-        LOGE("object 0x%08x was already scanned this generation\n",
-                (uintptr_t)obj);
-        dvmAbort();
-    }
-    ptr2chunk(obj)->oldScanGeneration = ptr2chunk(obj)->scanGeneration;
-    ptr2chunk(obj)->scanGeneration = gGeneration;
-    ptr2chunk(obj)->scanCount++;
-#endif
-
     /* Get and mark the class object for this particular instance.
      */
     clazz = obj->clazz;
@@ -566,10 +522,6 @@ static void scanObject(const Object *obj, GcMarkContext *ctx)
          */
         return;
     }
-
-#if WITH_OBJECT_HEADERS
-    gMarkParent = obj;
-#endif
 
     assert(dvmIsValidObject((Object *)clazz));
     markObjectNonNull((Object *)clazz, ctx);
@@ -720,10 +672,6 @@ static void scanObject(const Object *obj, GcMarkContext *ctx)
             scanClassObject((ClassObject *)obj, ctx);
         }
     }
-
-#if WITH_OBJECT_HEADERS
-    gMarkParent = NULL;
-#endif
 }
 
 static void
@@ -794,65 +742,36 @@ void dvmHeapScanMarkedObjects()
     LOG_SCAN("done with marked objects\n");
 }
 
-/** @return true if we need to schedule a call to clear().
+/** Clear the referent field.
  */
-static bool clearReference(Object *reference)
+static void clearReference(Object *reference)
 {
     /* This is what the default implementation of Reference.clear()
      * does.  We're required to clear all references to a given
      * referent atomically, so we can't pop in and out of interp
      * code each time.
      *
-     * Also, someone may have subclassed one of the basic Reference
-     * types, overriding clear().  We can't trust the clear()
-     * implementation to call super.clear();  we cannot let clear()
-     * resurrect the referent.  If we clear it here, we can safely
-     * call any overriding implementations.
+     * We don't ever actaully call overriding implementations of
+     * Reference.clear().
      */
     dvmSetFieldObject(reference,
             gDvm.offJavaLangRefReference_referent, NULL);
-
-#if FANCY_REFERENCE_SUBCLASS
-    /* See if clear() has actually been overridden.  If so,
-     * we need to schedule a call to it before calling enqueue().
-     */
-    if (reference->clazz->vtable[gDvm.voffJavaLangRefReference_clear]->clazz !=
-            gDvm.classJavaLangRefReference)
-    {
-        /* clear() has been overridden;  return true to indicate
-         * that we need to schedule a call to the real clear()
-         * implementation.
-         */
-        return true;
-    }
-#endif
-
-    return false;
 }
 
 /** @return true if we need to schedule a call to enqueue().
  */
 static bool enqueueReference(Object *reference)
 {
-#if FANCY_REFERENCE_SUBCLASS
-    /* See if this reference class has overridden enqueue();
-     * if not, we can take a shortcut.
-     */
-    if (reference->clazz->vtable[gDvm.voffJavaLangRefReference_enqueue]->clazz
-            == gDvm.classJavaLangRefReference)
-#endif
-    {
-        Object *queue = dvmGetFieldObject(reference,
-                gDvm.offJavaLangRefReference_queue);
-        Object *queueNext = dvmGetFieldObject(reference,
-                gDvm.offJavaLangRefReference_queueNext);
-        if (queue == NULL || queueNext != NULL) {
-            /* There is no queue, or the reference has already
-             * been enqueued.  The Reference.enqueue() method
-             * will do nothing even if we call it.
-             */
-            return false;
-        }
+    Object *queue = dvmGetFieldObject(reference,
+            gDvm.offJavaLangRefReference_queue);
+    Object *queueNext = dvmGetFieldObject(reference,
+            gDvm.offJavaLangRefReference_queueNext);
+    if (queue == NULL || queueNext != NULL) {
+        /* There is no queue, or the reference has already
+         * been enqueued.  The Reference.enqueue() method
+         * will do nothing even if we call it.
+         */
+        return false;
     }
 
     /* We need to call enqueue(), but if we called it from
@@ -872,8 +791,6 @@ void dvmHeapHandleReferences(Object *refListHead, enum RefType refType)
     const int offReferent = gDvm.offJavaLangRefReference_referent;
     bool workRequired = false;
 
-size_t numCleared = 0;
-size_t numEnqueued = 0;
     reference = refListHead;
     while (reference != NULL) {
         Object *next;
@@ -889,7 +806,7 @@ size_t numEnqueued = 0;
         //      the list, and it would be nice to avoid the extra
         //      work.
         if (referent != NULL && !isMarked(ptr2chunk(referent), markContext)) {
-            bool schedClear, schedEnqueue;
+            bool schedEnqueue;
 
             /* This is the strongest reference that refers to referent.
              * Do the right thing.
@@ -897,7 +814,7 @@ size_t numEnqueued = 0;
             switch (refType) {
             case REF_SOFT:
             case REF_WEAK:
-                schedClear = clearReference(reference);
+                clearReference(reference);
                 schedEnqueue = enqueueReference(reference);
                 break;
             case REF_PHANTOM:
@@ -911,8 +828,21 @@ size_t numEnqueued = 0;
                  * (The referent will be marked outside of this loop,
                  * after handing all references of this strength, in
                  * case multiple references point to the same object.)
+                 *
+                 * One exception: JNI "weak global" references are handled
+                 * as a special case.  They're identified by the queue.
                  */
-                schedClear = false;
+                if (gDvm.jniWeakGlobalRefQueue != NULL) {
+                    Object* queue = dvmGetFieldObject(reference,
+                            gDvm.offJavaLangRefReference_queue);
+                    if (queue == gDvm.jniWeakGlobalRefQueue) {
+                        LOGV("+++ WGR: clearing + not queueing %p:%p\n",
+                            reference, referent);
+                        clearReference(reference);
+                        schedEnqueue = false;
+                        break;
+                    }
+                }
 
                 /* A PhantomReference is only useful with a
                  * queue, but since it's possible to create one
@@ -922,19 +852,15 @@ size_t numEnqueued = 0;
                 break;
             default:
                 assert(!"Bad reference type");
-                schedClear = false;
                 schedEnqueue = false;
                 break;
             }
-numCleared += schedClear ? 1 : 0;
-numEnqueued += schedEnqueue ? 1 : 0;
 
-            if (schedClear || schedEnqueue) {
+            if (schedEnqueue) {
                 uintptr_t workBits;
 
-                /* Stuff the clear/enqueue bits in the bottom of
-                 * the pointer.  Assumes that objects are 8-byte
-                 * aligned.
+                /* Stuff the enqueue bit in the bottom of the pointer.
+                 * Assumes that objects are 8-byte aligned.
                  *
                  * Note that we are adding the *Reference* (which
                  * is by definition already marked at this point) to
@@ -942,12 +868,10 @@ numEnqueued += schedEnqueue ? 1 : 0;
                  * has already been cleared).
                  */
                 assert(((intptr_t)reference & 3) == 0);
-                assert(((WORKER_CLEAR | WORKER_ENQUEUE) & ~3) == 0);
-                workBits = (schedClear ? WORKER_CLEAR : 0) |
-                           (schedEnqueue ? WORKER_ENQUEUE : 0);
+                assert((WORKER_ENQUEUE & ~3) == 0);
                 if (!dvmHeapAddRefToLargeTable(
                         &gDvm.gcHeap->referenceOperations,
-                        (Object *)((uintptr_t)reference | workBits)))
+                        (Object *)((uintptr_t)reference | WORKER_ENQUEUE)))
                 {
                     LOGE_HEAP("dvmMalloc(): no room for any more "
                             "reference operations\n");
@@ -967,15 +891,13 @@ numEnqueued += schedEnqueue ? 1 : 0;
 
         reference = next;
     }
-#define refType2str(r) \
-    ((r) == REF_SOFT ? "soft" : ( \
-     (r) == REF_WEAK ? "weak" : ( \
-     (r) == REF_PHANTOM ? "phantom" : "UNKNOWN" )))
-LOGD_HEAP("dvmHeapHandleReferences(): cleared %zd, enqueued %zd %s references\n", numCleared, numEnqueued, refType2str(refType));
 
     /* Walk though the reference list again, and mark any non-clear/marked
      * referents.  Only PhantomReferences can have non-clear referents
      * at this point.
+     *
+     * (Could skip this for JNI weak globals, since we know they've been
+     * cleared.)
      */
     if (refType == REF_PHANTOM) {
         bool scanRequired = false;
@@ -1225,17 +1147,6 @@ sweepBitmapCallback(size_t numPtrs, void **ptrs, const void *finger, void *arg)
         hc = (DvmHeapChunk *)*ptrs++;
         obj = (Object *)chunk2ptr(hc);
 
-#if WITH_OBJECT_HEADERS
-        if (hc->markGeneration == gGeneration) {
-            LOGE("sweeping marked object: 0x%08x\n", (uint)obj);
-            dvmAbort();
-        }
-#endif
-
-        /* Free the monitor associated with the object.
-         */
-        dvmFreeObjectMonitor(obj);
-
         /* NOTE: Dereferencing clazz is dangerous.  If obj was the last
          * one to reference its class object, the class object could be
          * on the sweep list, and could already have been swept, leaving
@@ -1264,16 +1175,9 @@ sweepBitmapCallback(size_t numPtrs, void **ptrs, const void *finger, void *arg)
         {
             int chunklen;
             ClassObject *clazz = obj->clazz;
-#if WITH_OBJECT_HEADERS
-            DvmHeapChunk chunk = *hc;
-            chunk.header = ~OBJECT_HEADER | 1;
-#endif
             chunklen = dvmHeapSourceChunkSize(hc);
             memset(hc, 0xa5, chunklen);
             obj->clazz = (ClassObject *)((uintptr_t)clazz ^ 0xffffffff);
-#if WITH_OBJECT_HEADERS
-            *hc = chunk;
-#endif
         }
 #endif
     }
@@ -1284,8 +1188,7 @@ sweepBitmapCallback(size_t numPtrs, void **ptrs, const void *finger, void *arg)
     return true;
 }
 
-/* A function suitable for passing to dvmHashForeachRemove()
- * to clear out any unmarked objects.  Clears the low bits
+/* Returns true if the given object is unmarked.  Ignores the low bits
  * of the pointer because the intern table may set them.
  */
 static int isUnmarkedObject(void *object)
@@ -1333,6 +1236,8 @@ dvmHeapSweepUnmarkedObjects(int *numFreed, size_t *sizeFreed)
 #if WITH_HPROF && WITH_HPROF_UNREACHABLE
     hprofDumpUnmarkedObjects(markBitmaps, objectBitmaps, numBitmaps);
 #endif
+
+    dvmSweepMonitorList(&gDvm.monitorList, isUnmarkedObject);
 
     dvmHeapBitmapXorWalkLists(markBitmaps, objectBitmaps, numBitmaps,
             sweepBitmapCallback, NULL);

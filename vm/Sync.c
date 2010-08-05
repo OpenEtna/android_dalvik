@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 /*
  * Fundamental synchronization mechanisms.
  *
@@ -29,24 +30,10 @@
  *  - using a pool of monitor objects, with some sort of recycling scheme
  *
  * TODO: recycle native-level monitors when objects are garbage collected.
- *
- * NOTE: if we broadcast a notify, and somebody sneaks in a Thread.interrupt
- * before the notify finishes (i.e. before all threads sleeping on the
- * condition variable have awoken), we could end up with a nonzero value for
- * "notifying" after everybody is gone because one of the notified threads
- * will actually exit via the "interrupted" path.  This can be detected as
- * (notifying + interrupting > waiting), i.e. the number of threads that need
- * to be woken is greater than the number waiting.  The fix is to test and
- * adjust "notifying" at the start of the wait() call.
- * -> This is probably not a problem if we notify less than the full set
- * before the interrupt comes in.  If we have four waiters, two pending
- * notifies, and an interrupt hits, we will interrupt one thread and notify
- * two others.  Doesn't matter if the interrupted thread would have been
- * one of the notified.  Count is only screwed up if we have two waiters,
- * in which case it's safe to fix it at the start of the next wait().
  */
 #include "Dalvik.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -92,37 +79,26 @@ static void expandObjClear(ExpandingObjectList* pList);
  * (ACM 1998).  Things are even easier for us, though, because we have
  * a full 32 bits to work with.
  *
- * The two states that an Object's lock may have are referred to as
- * "thin" and "fat".  The lock may transition between the two states
- * for various reasons.
+ * The two states of an Object's lock are referred to as "thin" and
+ * "fat".  A lock may transition from the "thin" state to the "fat"
+ * state and this transition is referred to as inflation.  Once a lock
+ * has been inflated it remains in the "fat" state indefinitely.
  *
- * The lock value itself is stored in Object.lock, which is a union of
- * the form:
+ * The lock value itself is stored in Object.lock.  The LSB of the
+ * lock encodes its state.  When cleared, the lock is in the "thin"
+ * state and its bits are formatted as follows:
  *
- *     typedef union Lock {
- *         u4          thin;
- *         Monitor*    mon;
- *     } Lock;
+ *    [31 ---- 19] [18 ---- 3] [2 ---- 1] [0]
+ *     lock count   thread id  hash state  0
  *
- * It is possible to tell the current state of the lock from the actual
- * value, so we do not need to store any additional state.  When the
- * lock is "thin", it has the form:
+ * When set, the lock is in the "fat" state and its bits are formatted
+ * as follows:
  *
- *     [31 ---- 16] [15 ---- 1] [0]
- *      lock count   thread id   1
- *
- * When it is "fat", the field is simply a (Monitor *).  Since the pointer
- * will always be 4-byte-aligned, bits 1 and 0 will always be zero when
- * the field holds a pointer.  Hence, we can tell the current fat-vs-thin
- * state by checking the least-significant bit.
+ *    [31 ---- 3] [2 ---- 1] [0]
+ *      pointer   hash state  1
  *
  * For an in-depth description of the mechanics of thin-vs-fat locking,
  * read the paper referred to above.
- *
- * To reduce the amount of work when attempting a compare and exchange,
- * Thread.threadId is guaranteed to have bit 0 set, and all new Objects
- * have their lock fields initialized to the value 0x1, or
- * DVM_LOCK_INITIAL_THIN_VALUE, via DVM_OBJECT_INIT().
  */
 
 /*
@@ -141,12 +117,9 @@ struct Monitor {
     int         lockCount;      /* owner's recursive lock depth */
     Object*     obj;            /* what object are we part of [debug only] */
 
-    int         waiting;        /* total #of threads waiting on this */
-    int         notifying;      /* #of threads being notified */
-    int         interrupting;   /* #of threads being interrupted */
+    Thread*     waitSet;	/* threads currently waiting on this monitor */
 
     pthread_mutex_t lock;
-    pthread_cond_t  cond;
 
     Monitor*    next;
 
@@ -187,9 +160,12 @@ Monitor* dvmCreateMonitor(Object* obj)
         LOGE("Unable to allocate monitor\n");
         dvmAbort();
     }
+    if (((u4)mon & 7) != 0) {
+        LOGE("Misaligned monitor: %p\n", mon);
+        dvmAbort();
+    }
     mon->obj = obj;
     dvmInitMutex(&mon->lock);
-    pthread_cond_init(&mon->cond, NULL);
 
     /* replace the head of the list with the new monitor */
     do {
@@ -198,14 +174,6 @@ Monitor* dvmCreateMonitor(Object* obj)
                               (int32_t)mon->next, (int32_t)mon));
 
     return mon;
-}
-
-/*
- * Release a Monitor.
- */
-static void releaseMonitor(Monitor* mon)
-{
-    // TODO
 }
 
 /*
@@ -269,6 +237,43 @@ Object* dvmGetMonitorObject(Monitor* mon)
 }
 
 /*
+ * Returns the thread id of the thread owning the given lock.
+ */
+static u4 lockOwner(Object* obj)
+{
+    Thread *owner;
+    u4 lock;
+
+    assert(obj != NULL);
+    /*
+     * Since we're reading the lock value multiple times, latch it so
+     * that it doesn't change out from under us if we get preempted.
+     */
+    lock = obj->lock;
+    if (LW_SHAPE(lock) == LW_SHAPE_THIN) {
+        return LW_LOCK_OWNER(lock);
+    } else {
+        owner = LW_MONITOR(lock)->owner;
+        return owner ? owner->threadId : 0;
+    }
+}
+
+/*
+ * Get the thread that holds the lock on the specified object.  The
+ * object may be unlocked, thin-locked, or fat-locked.
+ *
+ * The caller must lock the thread list before calling here.
+ */
+Thread* dvmGetObjectLockHolder(Object* obj)
+{
+    u4 threadId = lockOwner(obj);
+
+    if (threadId == 0)
+        return NULL;
+    return dvmGetThreadByThreadId(threadId);
+}
+
+/*
  * Checks whether the given thread holds the given
  * objects's lock.
  */
@@ -276,17 +281,8 @@ bool dvmHoldsLock(Thread* thread, Object* obj)
 {
     if (thread == NULL || obj == NULL) {
         return false;
-    }
-
-    /* Since we're reading the lock value multiple times,
-     * latch it so that it doesn't change out from under
-     * us if we get preempted.
-     */
-    Lock lock = obj->lock;
-    if (IS_LOCK_FAT(&lock)) {
-        return thread == lock.mon->owner;
     } else {
-        return thread->threadId == (lock.thin & 0xffff);
+        return thread->threadId == lockOwner(obj);
     }
 }
 
@@ -294,21 +290,19 @@ bool dvmHoldsLock(Thread* thread, Object* obj)
  * Free the monitor associated with an object and make the object's lock
  * thin again.  This is called during garbage collection.
  */
-void dvmFreeObjectMonitor_internal(Lock *lock)
+static void freeObjectMonitor(Object* obj)
 {
     Monitor *mon;
 
-    /* The macro that wraps this function checks IS_LOCK_FAT() first.
-     */
-    assert(IS_LOCK_FAT(lock));
+    assert(LW_SHAPE(obj->lock) == LW_SHAPE_FAT);
 
 #ifdef WITH_DEADLOCK_PREDICTION
     if (gDvm.deadlockPredictMode != kDPOff)
-        removeCollectedObject(lock->mon->obj);
+        removeCollectedObject(obj);
 #endif
 
-    mon = lock->mon;
-    lock->thin = DVM_LOCK_INITIAL_THIN_VALUE;
+    mon = LW_MONITOR(obj->lock);
+    obj->lock = DVM_LOCK_INITIAL_THIN_VALUE;
 
     /* This lock is associated with an object
      * that's being swept.  The only possible way
@@ -319,55 +313,157 @@ void dvmFreeObjectMonitor_internal(Lock *lock)
      */
     assert(pthread_mutex_trylock(&mon->lock) == 0);
     pthread_mutex_destroy(&mon->lock);
-    pthread_cond_destroy(&mon->cond);
-#if 1
-//TODO: unlink from the monitor list (would require a lock)
-// (might not -- the GC suspension may be enough)
-    {
-        Monitor *next;
-        next = mon->next;
 #ifdef WITH_DEADLOCK_PREDICTION
-        expandObjClear(&mon->historyChildren);
-        expandObjClear(&mon->historyParents);
-        free(mon->historyRawStackTrace);
+    expandObjClear(&mon->historyChildren);
+    expandObjClear(&mon->historyParents);
+    free(mon->historyRawStackTrace);
 #endif
-        memset(mon, 0, sizeof (*mon));
-        mon->next = next;
-    }
-//free(mon);
-#endif
+    free(mon);
 }
 
+/*
+ * Frees monitor objects belonging to unmarked objects.
+ */
+void dvmSweepMonitorList(Monitor** mon, int (*isUnmarkedObject)(void*))
+{
+    Monitor handle;
+    Monitor *prev, *curr;
+    Object *obj;
+
+    assert(mon != NULL);
+    assert(*mon != NULL);
+    assert(isUnmarkedObject != NULL);
+    prev = &handle;
+    prev->next = curr = *mon;
+    while (curr != NULL) {
+        obj = curr->obj;
+        if (obj != NULL && (*isUnmarkedObject)(obj) != 0) {
+            prev->next = curr = curr->next;
+            freeObjectMonitor(obj);
+        } else {
+            prev = curr;
+            curr = curr->next;
+        }
+    }
+    *mon = handle.next;
+}
+
+static char *logWriteInt(char *dst, int value)
+{
+    *dst++ = EVENT_TYPE_INT;
+    set4LE((u1 *)dst, value);
+    return dst + 4;
+}
+
+static char *logWriteString(char *dst, const char *value, size_t len)
+{
+    *dst++ = EVENT_TYPE_STRING;
+    len = len < 32 ? len : 32;
+    set4LE((u1 *)dst, len);
+    dst += 4;
+    memcpy(dst, value, len);
+    return dst + len;
+}
+
+#define EVENT_LOG_TAG_dvm_lock_sample 20003
+
+static void logContentionEvent(Thread *self, u4 waitMs, u4 samplePercent)
+{
+    const StackSaveArea *saveArea;
+    const Method *meth;
+    u4 relativePc;
+    char eventBuffer[132];
+    const char *fileName;
+    char procName[33], *selfName, *ownerName;
+    char *cp;
+    size_t len;
+    int fd;
+
+    saveArea = SAVEAREA_FROM_FP(self->curFrame);
+    meth = saveArea->method;
+    cp = eventBuffer;
+
+    /* Emit the event list length, 1 byte. */
+    *cp++ = 7;
+
+    /* Emit the process name, <= 37 bytes. */
+    fd = open("/proc/self/cmdline", O_RDONLY);
+    memset(procName, 0, sizeof(procName));
+    read(fd, procName, sizeof(procName) - 1);
+    close(fd);
+    len = strlen(procName);
+    cp = logWriteString(cp, procName, len);
+
+    /* Emit the main thread status, 5 bytes. */
+    bool isMainThread = (self->systemTid == getpid());
+    cp = logWriteInt(cp, isMainThread);
+
+    /* Emit self thread name string, <= 37 bytes. */
+    selfName = dvmGetThreadName(self);
+    cp = logWriteString(cp, selfName, strlen(selfName));
+    free(selfName);
+
+    /* Emit the wait time, 5 bytes. */
+    cp = logWriteInt(cp, waitMs);
+
+    /* Emit the source code file name, <= 37 bytes. */
+    fileName = dvmGetMethodSourceFile(meth);
+    if (fileName == NULL) fileName = "";
+    cp = logWriteString(cp, fileName, strlen(fileName));
+
+    /* Emit the source code line number, 5 bytes. */
+    relativePc = saveArea->xtra.currentPc - saveArea->method->insns;
+    cp = logWriteInt(cp, dvmLineNumFromPC(meth, relativePc));
+
+    /* Emit the sample percentage, 5 bytes. */
+    cp = logWriteInt(cp, samplePercent);
+
+    assert((size_t)(cp - eventBuffer) <= sizeof(eventBuffer));
+    android_btWriteLog(EVENT_LOG_TAG_dvm_lock_sample,
+                       EVENT_TYPE_LIST,
+                       eventBuffer,
+                       (size_t)(cp - eventBuffer));
+}
 
 /*
  * Lock a monitor.
  */
 static void lockMonitor(Thread* self, Monitor* mon)
 {
-    int cc;
+    Thread *owner;
+    ThreadStatus oldStatus;
+    u4 waitThreshold, samplePercent;
+    u8 waitStart, waitEnd, waitMs;
 
     if (mon->owner == self) {
         mon->lockCount++;
-    } else {
-        ThreadStatus oldStatus;
-
-        if (pthread_mutex_trylock(&mon->lock) != 0) {
-            /* mutex is locked, switch to wait status and sleep on it */
-            oldStatus = dvmChangeStatus(self, THREAD_MONITOR);
-            cc = pthread_mutex_lock(&mon->lock);
-            assert(cc == 0);
-            dvmChangeStatus(self, oldStatus);
-        }
-
-        mon->owner = self;
-        assert(mon->lockCount == 0);
-
-        /*
-         * "waiting", "notifying", and "interrupting" could all be nonzero
-         * if we're locking an object on which other threads are waiting.
-         * Nothing worth assert()ing about here.
-         */
+        return;
     }
+    if (pthread_mutex_trylock(&mon->lock) != 0) {
+        oldStatus = dvmChangeStatus(self, THREAD_MONITOR);
+        waitThreshold = gDvm.lockProfThreshold;
+        if (waitThreshold) {
+            waitStart = dvmGetRelativeTimeUsec();
+        }
+        dvmLockMutex(&mon->lock);
+        if (waitThreshold) {
+            waitEnd = dvmGetRelativeTimeUsec();
+        }
+        dvmChangeStatus(self, oldStatus);
+        if (waitThreshold) {
+            waitMs = (waitEnd - waitStart) / 1000;
+            if (waitMs >= waitThreshold) {
+                samplePercent = 100;
+            } else {
+                samplePercent = 100 * waitMs / waitThreshold;
+            }
+            if (samplePercent != 0 && ((u4)rand() % 100 < samplePercent)) {
+                logContentionEvent(self, waitMs, samplePercent);
+            }
+        }
+    }
+    mon->owner = self;
+    assert(mon->lockCount == 0);
 }
 
 /*
@@ -403,6 +499,7 @@ static bool tryLockMonitor(Thread* self, Monitor* mon)
  */
 static bool unlockMonitor(Thread* self, Monitor* mon)
 {
+    assert(self != NULL);
     assert(mon != NULL);        // can this happen?
 
     if (mon->owner == self) {
@@ -423,17 +520,135 @@ static bool unlockMonitor(Thread* self, Monitor* mon)
          * The JNI spec says that we should throw IllegalMonitorStateException
          * in this case.
          */
-        if (mon->owner == NULL) {
-            //LOGW("Unlock fat %p: not owned\n", mon->obj);
-        } else {
-            //LOGW("Unlock fat %p: id %d vs %d\n",
-            //    mon->obj, mon->owner->threadId, self->threadId);
-        }
         dvmThrowException("Ljava/lang/IllegalMonitorStateException;",
-            "unlock of unowned monitor");
+                          "unlock of unowned monitor");
         return false;
     }
     return true;
+}
+
+/*
+ * Checks the wait set for circular structure.  Returns 0 if the list
+ * is not circular.  Otherwise, returns 1.  Used only by asserts.
+ */
+static int waitSetCheck(Monitor *mon)
+{
+    Thread *fast, *slow;
+    size_t n;
+
+    assert(mon != NULL);
+    fast = slow = mon->waitSet;
+    n = 0;
+    for (;;) {
+        if (fast == NULL) return 0;
+        if (fast->waitNext == NULL) return 0;
+        if (fast == slow && n > 0) return 1;
+        n += 2;
+        fast = fast->waitNext->waitNext;
+        slow = slow->waitNext;
+    }
+}
+
+/*
+ * Links a thread into a monitor's wait set.  The monitor lock must be
+ * held by the caller of this routine.
+ */
+static void waitSetAppend(Monitor *mon, Thread *thread)
+{
+    Thread *elt;
+
+    assert(mon != NULL);
+    assert(mon->owner == dvmThreadSelf());
+    assert(thread != NULL);
+    assert(thread->waitNext == NULL);
+    assert(waitSetCheck(mon) == 0);
+    if (mon->waitSet == NULL) {
+        mon->waitSet = thread;
+        return;
+    }
+    elt = mon->waitSet;
+    while (elt->waitNext != NULL) {
+        elt = elt->waitNext;
+    }
+    elt->waitNext = thread;
+}
+
+/*
+ * Unlinks a thread from a monitor's wait set.  The monitor lock must
+ * be held by the caller of this routine.
+ */
+static void waitSetRemove(Monitor *mon, Thread *thread)
+{
+    Thread *elt;
+
+    assert(mon != NULL);
+    assert(mon->owner == dvmThreadSelf());
+    assert(thread != NULL);
+    assert(waitSetCheck(mon) == 0);
+    if (mon->waitSet == NULL) {
+        return;
+    }
+    if (mon->waitSet == thread) {
+        mon->waitSet = thread->waitNext;
+        thread->waitNext = NULL;
+        return;
+    }
+    elt = mon->waitSet;
+    while (elt->waitNext != NULL) {
+        if (elt->waitNext == thread) {
+            elt->waitNext = thread->waitNext;
+            thread->waitNext = NULL;
+            return;
+        }
+        elt = elt->waitNext;
+    }
+}
+
+/*
+ * Converts the given relative waiting time into an absolute time.
+ */
+void absoluteTime(s8 msec, s4 nsec, struct timespec *ts)
+{
+    s8 endSec;
+
+#ifdef HAVE_TIMEDWAIT_MONOTONIC
+    clock_gettime(CLOCK_MONOTONIC, ts);
+#else
+    {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        ts->tv_sec = tv.tv_sec;
+        ts->tv_nsec = tv.tv_usec * 1000;
+    }
+#endif
+    endSec = ts->tv_sec + msec / 1000;
+    if (endSec >= 0x7fffffff) {
+        LOGV("NOTE: end time exceeds epoch\n");
+        endSec = 0x7ffffffe;
+    }
+    ts->tv_sec = endSec;
+    ts->tv_nsec = (ts->tv_nsec + (msec % 1000) * 1000000) + nsec;
+
+    /* catch rollover */
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
+int dvmRelativeCondWait(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                        s8 msec, s4 nsec)
+{
+    int ret;
+    struct timespec ts;
+    absoluteTime(msec, nsec, &ts);
+#if defined(HAVE_TIMEDWAIT_MONOTONIC)
+    ret = pthread_cond_timedwait_monotonic(cond, mutex, &ts);
+#else
+    ret = pthread_cond_timedwait(cond, mutex, &ts);
+#endif
+    assert(ret == 0 || ret == ETIMEDOUT);
+    return ret;
 }
 
 /*
@@ -465,10 +680,13 @@ static void waitMonitor(Thread* self, Monitor* mon, s8 msec, s4 nsec,
     struct timespec ts;
     bool wasInterrupted = false;
     bool timed;
-    int cc;
+    int ret;
 
-    /* Make sure that the lock is fat and that we hold it. */
-    if (mon == NULL || ((u4)mon & 1) != 0 || mon->owner != self) {
+    assert(self != NULL);
+    assert(mon != NULL);
+
+    /* Make sure that we hold the lock. */
+    if (mon->owner != self) {
         dvmThrowException("Ljava/lang/IllegalMonitorStateException;",
             "object not locked by thread before wait()");
         return;
@@ -489,50 +707,8 @@ static void waitMonitor(Thread* self, Monitor* mon, s8 msec, s4 nsec,
     if (msec == 0 && nsec == 0) {
         timed = false;
     } else {
-        s8 endSec;
-
-#ifdef HAVE_TIMEDWAIT_MONOTONIC
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        endSec = now.tv_sec + msec / 1000;
-        if (endSec >= 0x7fffffff) {
-            LOGV("NOTE: end time exceeds epoch\n");
-            endSec = 0x7ffffffe;
-        }
-        ts.tv_sec = endSec;
-        ts.tv_nsec = (now.tv_nsec + (msec % 1000) * 1000 * 1000) + nsec;
-#else
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        endSec = now.tv_sec + msec / 1000;
-        if (endSec >= 0x7fffffff) {
-            LOGV("NOTE: end time exceeds epoch\n");
-            endSec = 0x7ffffffe;
-        }
-        ts.tv_sec = endSec;
-        ts.tv_nsec = (now.tv_usec + (msec % 1000) * 1000) * 1000 + nsec;
-#endif
-
-        /* catch rollover */
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
+        absoluteTime(msec, nsec, &ts);
         timed = true;
-    }
-
-    /*
-     * Make sure "notifying" wasn't screwed up by earlier activity.  If this
-     * is wrong we could end up waking up too many people.  (This is a rare
-     * situation, but we need to handle it correctly.)
-     */
-    if (mon->notifying + mon->interrupting > mon->waiting) {
-        LOGD("threadid=%d: bogus mon %d+%d>%d; adjusting\n",
-            self->threadId, mon->notifying, mon->interrupting,
-            mon->waiting);
-
-        assert(mon->waiting >= mon->interrupting);
-        mon->notifying = mon->waiting - mon->interrupting;
     }
 
     /*
@@ -540,14 +716,14 @@ static void waitMonitor(Thread* self, Monitor* mon, s8 msec, s4 nsec,
      * release our hold.  We need to let it go even if we're a few levels
      * deep in a recursive lock, and we need to restore that later.
      *
-     * The order of operations here isn't significant, because we still
-     * hold the pthread mutex.
+     * We append to the wait set ahead of clearing the count and owner
+     * fields so the subroutine can check that the calling thread owns
+     * the monitor.  Aside from that, the order of member updates is
+     * not order sensitive as we hold the pthread mutex.
      */
-    int prevLockCount;
-
-    prevLockCount = mon->lockCount;
+    waitSetAppend(mon, self);
+    int prevLockCount = mon->lockCount;
     mon->lockCount = 0;
-    mon->waiting++;
     mon->owner = NULL;
 
     /*
@@ -560,12 +736,15 @@ static void waitMonitor(Thread* self, Monitor* mon, s8 msec, s4 nsec,
     else
         dvmChangeStatus(self, THREAD_WAIT);
 
+    ret = pthread_mutex_lock(&self->waitMutex);
+    assert(ret == 0);
+
     /*
-     * Tell the thread which monitor we're waiting on.  This is necessary
-     * so that Thread.interrupt() can wake us up.  Thread.interrupt needs
-     * to gain ownership of the monitor mutex before it can signal us, so
-     * we're still not worried about race conditions.
+     * Set waitMonitor to the monitor object we will be waiting on.
+     * When waitMonitor is non-NULL a notifying or interrupting thread
+     * must signal the thread's waitCond to wake it up.
      */
+    assert(self->waitMonitor == NULL);
     self->waitMonitor = mon;
 
     /*
@@ -574,82 +753,50 @@ static void waitMonitor(Thread* self, Monitor* mon, s8 msec, s4 nsec,
      */
     if (self->interrupted) {
         wasInterrupted = true;
+        self->waitMonitor = NULL;
+        pthread_mutex_unlock(&self->waitMutex);
         goto done;
     }
 
-    LOGVV("threadid=%d: waiting on %p\n", self->threadId, mon);
+    /*
+     * Release the monitor lock and wait for a notification or
+     * a timeout to occur.
+     */
+    pthread_mutex_unlock(&mon->lock);
 
-    while (true) {
-        if (!timed) {
-            cc = pthread_cond_wait(&mon->cond, &mon->lock);
-            assert(cc == 0);
-        } else {
+    if (!timed) {
+        ret = pthread_cond_wait(&self->waitCond, &self->waitMutex);
+        assert(ret == 0);
+    } else {
 #ifdef HAVE_TIMEDWAIT_MONOTONIC
-            cc = pthread_cond_timedwait_monotonic(&mon->cond, &mon->lock, &ts);
+        ret = pthread_cond_timedwait_monotonic(&self->waitCond, &self->waitMutex, &ts);
 #else
-            cc = pthread_cond_timedwait(&mon->cond, &mon->lock, &ts);
+        ret = pthread_cond_timedwait(&self->waitCond, &self->waitMutex, &ts);
 #endif
-            if (cc == ETIMEDOUT) {
-                LOGVV("threadid=%d wakeup: timeout\n", self->threadId);
-                break;
-            }
-        }
-
-        /*
-         * We woke up because of an interrupt (which does a broadcast) or
-         * a notification (which might be a signal or a broadcast).  Figure
-         * out what we need to do.
-         */
-        if (self->interruptingWait) {
-            /*
-             * The other thread successfully gained the monitor lock, and
-             * has confirmed that we were waiting on it.  If this is an
-             * interruptible wait, we bail out immediately.  If not, we
-             * continue on.
-             */
-            self->interruptingWait = false;
-            mon->interrupting--;
-            assert(self->interrupted);
-            if (interruptShouldThrow) {
-                wasInterrupted = true;
-                LOGD("threadid=%d wakeup: interrupted\n", self->threadId);
-                break;
-            } else {
-                LOGD("threadid=%d wakeup: not interruptible\n", self->threadId);
-            }
-        }
-        if (mon->notifying) {
-            /*
-             * One or more threads are being notified.  Remove ourselves
-             * from the set.
-             */
-            mon->notifying--;
-            LOGVV("threadid=%d wakeup: notified\n", self->threadId);
-            break;
-        } else {
-            /*
-             * Looks like we were woken unnecessarily, probably as a
-             * result of another thread being interrupted.  Go back to
-             * sleep.
-             */
-            LOGVV("threadid=%d wakeup: going back to sleep\n", self->threadId);
-        }
+        assert(ret == 0 || ret == ETIMEDOUT);
+    }
+    if (self->interrupted) {
+        wasInterrupted = true;
     }
 
-done:
-    //if (wasInterrupted) {
-    //    LOGW("threadid=%d: throwing InterruptedException:\n", self->threadId);
-    //    dvmDumpThread(self, false);
-    //}
-
-    /*
-     * Put everything back.  Again, we hold the pthread mutex, so the order
-     * here isn't significant.
-     */
+    self->interrupted = false;
     self->waitMonitor = NULL;
+
+    pthread_mutex_unlock(&self->waitMutex);
+
+    /* Reacquire the monitor lock. */
+    lockMonitor(self, mon);
+
+done:
+    /*
+     * We remove our thread from wait set after restoring the count
+     * and owner fields so the subroutine can check that the calling
+     * thread owns the monitor. Aside from that, the order of member
+     * updates is not order sensitive as we hold the pthread mutex.
+     */
     mon->owner = self;
-    mon->waiting--;
     mon->lockCount = prevLockCount;
+    waitSetRemove(mon, self);
 
     /* set self->status back to THREAD_RUNNING, and self-suspend if needed */
     dvmChangeStatus(self, THREAD_RUNNING);
@@ -657,7 +804,7 @@ done:
     if (wasInterrupted) {
         /*
          * We were interrupted while waiting, or somebody interrupted an
-         * un-interruptable thread earlier and we're bailing out immediately.
+         * un-interruptible thread earlier and we're bailing out immediately.
          *
          * The doc sayeth: "The interrupted status of the current thread is
          * cleared when this exception is thrown."
@@ -673,65 +820,62 @@ done:
  */
 static void notifyMonitor(Thread* self, Monitor* mon)
 {
-    /* Make sure that the lock is fat and that we hold it. */
-    if (mon == NULL || ((u4)mon & 1) != 0 || mon->owner != self) {
+    Thread* thread;
+
+    assert(self != NULL);
+    assert(mon != NULL);
+
+    /* Make sure that we hold the lock. */
+    if (mon->owner != self) {
         dvmThrowException("Ljava/lang/IllegalMonitorStateException;",
             "object not locked by thread before notify()");
         return;
     }
-
-    /*
-     * Check to see if anybody is there to notify.  We subtract off
-     * threads that are being interrupted and anything that has
-     * potentially already been notified.
-     */
-    if (mon->notifying + mon->interrupting < mon->waiting) {
-        /* wake up one thread */
-        int cc;
-
-        LOGVV("threadid=%d: signaling on %p\n", self->threadId, mon);
-
-        mon->notifying++;
-        cc = pthread_cond_signal(&mon->cond);
-        assert(cc == 0);
-    } else {
-        LOGVV("threadid=%d: nobody to signal on %p\n", self->threadId, mon);
+    /* Signal the first waiting thread in the wait set. */
+    while (mon->waitSet != NULL) {
+        thread = mon->waitSet;
+        mon->waitSet = thread->waitNext;
+        thread->waitNext = NULL;
+        pthread_mutex_lock(&thread->waitMutex);
+        /* Check to see if the thread is still waiting. */
+        if (thread->waitMonitor != NULL) {
+            pthread_cond_signal(&thread->waitCond);
+            pthread_mutex_unlock(&thread->waitMutex);
+            return;
+        }
+        pthread_mutex_unlock(&thread->waitMutex);
     }
 }
 
 /*
  * Notify all threads waiting on this monitor.
- *
- * We keep a count of how many threads we notified, so that our various
- * counts remain accurate.
  */
 static void notifyAllMonitor(Thread* self, Monitor* mon)
 {
-    /* Make sure that the lock is fat and that we hold it. */
-    if (mon == NULL || ((u4)mon & 1) != 0 || mon->owner != self) {
+    Thread* thread;
+
+    assert(self != NULL);
+    assert(mon != NULL);
+
+    /* Make sure that we hold the lock. */
+    if (mon->owner != self) {
         dvmThrowException("Ljava/lang/IllegalMonitorStateException;",
             "object not locked by thread before notifyAll()");
         return;
     }
-
-    mon->notifying = mon->waiting - mon->interrupting;
-    if (mon->notifying > 0) {
-        int cc;
-
-        LOGVV("threadid=%d: broadcasting to %d threads on %p\n",
-            self->threadId, mon->notifying, mon);
-
-        cc = pthread_cond_broadcast(&mon->cond);
-        assert(cc == 0);
-    } else {
-        LOGVV("threadid=%d: nobody to broadcast to on %p\n", self->threadId,mon);
+    /* Signal all threads in the wait set. */
+    while (mon->waitSet != NULL) {
+        thread = mon->waitSet;
+        mon->waitSet = thread->waitNext;
+        thread->waitNext = NULL;
+        pthread_mutex_lock(&thread->waitMutex);
+        /* Check to see if the thread is still waiting. */
+        if (thread->waitMonitor != NULL) {
+            pthread_cond_signal(&thread->waitCond);
+        }
+        pthread_mutex_unlock(&thread->waitMutex);
     }
 }
-
-#if THIN_LOCKING
-/*
- * Thin locking support
- */
 
 /*
  * Implements monitorenter for "synchronized" stuff.
@@ -741,65 +885,86 @@ static void notifyAllMonitor(Thread* self, Monitor* mon)
  */
 void dvmLockObject(Thread* self, Object *obj)
 {
-    volatile u4 *thinp = &obj->lock.thin;
-    u4 threadId = self->threadId;
+    volatile u4 *thinp;
+    Monitor *mon;
+    ThreadStatus oldStatus;
+    useconds_t sleepDelay;
+    const useconds_t maxSleepDelay = 1 << 20;
+    u4 thin, newThin, threadId;
 
-    /* First, try to grab the lock as if it's thin;
-     * this is the common case and will usually succeed.
-     */
-    if (!ATOMIC_CMP_SWAP((int32_t *)thinp,
-                         (int32_t)DVM_LOCK_INITIAL_THIN_VALUE,
-                         (int32_t)threadId)) {
-        /* The lock is either a thin lock held by someone (possibly 'self'),
-         * or a fat lock.
+    assert(self != NULL);
+    assert(obj != NULL);
+    threadId = self->threadId;
+    thinp = &obj->lock;
+retry:
+    thin = *thinp;
+    if (LW_SHAPE(thin) == LW_SHAPE_THIN) {
+        /*
+         * The lock is a thin lock.  The owner field is used to
+         * determine the acquire method, ordered by cost.
          */
-        if ((*thinp & 0xffff) == threadId) {
-            /* 'self' is already holding the thin lock; we can just
-             * bump the count.  Atomic operations are not necessary
-             * because only the thread holding the lock is allowed
-             * to modify the Lock field.
+        if (LW_LOCK_OWNER(thin) == threadId) {
+            /*
+             * The calling thread owns the lock.  Increment the
+             * value of the recursion count field.
              */
-            *thinp += 1<<16;
+            obj->lock += 1 << LW_LOCK_COUNT_SHIFT;
+        } else if (LW_LOCK_OWNER(thin) == 0) {
+            /*
+             * The lock is unowned.  Install the thread id of the
+             * calling thread into the owner field.  This is the
+             * common case.  In performance critical code the JIT
+             * will have tried this before calling out to the VM.
+             */
+            newThin = thin | (threadId << LW_LOCK_OWNER_SHIFT);
+            if (!ATOMIC_CMP_SWAP((int32_t *)thinp, thin, newThin)) {
+                /*
+                 * The acquire failed.  Try again.
+                 */
+                goto retry;
+            }
         } else {
-            /* If this is a thin lock we need to spin on it, if it's fat
-             * we need to acquire the monitor.
+            LOG_THIN("(%d) spin on lock %p: %#x (%#x) %#x",
+                     threadId, &obj->lock, 0, *thinp, thin);
+            /*
+             * The lock is owned by another thread.  Notify the VM
+             * that we are about to wait.
              */
-            if ((*thinp & 1) != 0) {
-                ThreadStatus oldStatus;
-                static const unsigned long maxSleepDelay = 1 * 1024 * 1024;
-                unsigned long sleepDelay;
-
-                LOG_THIN("(%d) spin on lock 0x%08x: 0x%08x (0x%08x) 0x%08x\n",
-                         threadId, (uint)&obj->lock,
-                         DVM_LOCK_INITIAL_THIN_VALUE, *thinp, threadId);
-
-                /* The lock is still thin, but some other thread is
-                 * holding it.  Let the VM know that we're about
-                 * to wait on another thread.
+            oldStatus = dvmChangeStatus(self, THREAD_MONITOR);
+            /*
+             * Spin until the thin lock is released or inflated.
+             */
+            sleepDelay = 0;
+            for (;;) {
+                thin = *thinp;
+                /*
+                 * Check the shape of the lock word.  Another thread
+                 * may have inflated the lock while we were waiting.
                  */
-                oldStatus = dvmChangeStatus(self, THREAD_MONITOR);
-
-                /* Spin until the other thread lets go.
-                 */
-                sleepDelay = 0;
-                do {
-                    /* In addition to looking for an unlock,
-                     * we need to watch out for some other thread
-                     * fattening the lock behind our back.
-                     */
-                    while (*thinp != DVM_LOCK_INITIAL_THIN_VALUE) {
-                        if ((*thinp & 1) == 0) {
-                            /* The lock has been fattened already.
+                if (LW_SHAPE(thin) == LW_SHAPE_THIN) {
+                    if (LW_LOCK_OWNER(thin) == 0) {
+                        /*
+                         * The lock has been released.  Install the
+                         * thread id of the calling thread into the
+                         * owner field.
+                         */
+                        newThin = thin | (threadId << LW_LOCK_OWNER_SHIFT);
+                        if (ATOMIC_CMP_SWAP((int32_t *)thinp,
+                                            thin, newThin)) {
+                            /*
+                             * The acquire succeed.  Break out of the
+                             * loop and proceed to inflate the lock.
                              */
-                            LOG_THIN("(%d) lock 0x%08x surprise-fattened\n",
-                                     threadId, (uint)&obj->lock);
-                            dvmChangeStatus(self, oldStatus);
-                            goto fat_lock;
+                            break;
                         }
-
+                    } else {
+                        /*
+                         * The lock has not been released.  Yield so
+                         * the owning thread can run.
+                         */
                         if (sleepDelay == 0) {
                             sched_yield();
-                            sleepDelay = 1 * 1000;
+                            sleepDelay = 1000;
                         } else {
                             usleep(sleepDelay);
                             if (sleepDelay < maxSleepDelay / 2) {
@@ -807,41 +972,44 @@ void dvmLockObject(Thread* self, Object *obj)
                             }
                         }
                     }
-                } while (!ATOMIC_CMP_SWAP((int32_t *)thinp,
-                                          (int32_t)DVM_LOCK_INITIAL_THIN_VALUE,
-                                          (int32_t)threadId));
-                LOG_THIN("(%d) spin on lock done 0x%08x: "
-                         "0x%08x (0x%08x) 0x%08x\n",
-                         threadId, (uint)&obj->lock,
-                         DVM_LOCK_INITIAL_THIN_VALUE, *thinp, threadId);
-
-                /* We've got the thin lock; let the VM know that we're
-                 * done waiting.
-                 */
-                dvmChangeStatus(self, oldStatus);
-
-                /* Fatten the lock.  Note this relinquishes ownership.
-                 * We could also create the monitor in an "owned" state
-                 * to avoid "re-locking" it in fat_lock.
-                 */
-                obj->lock.mon = dvmCreateMonitor(obj);
-                LOG_THIN("(%d) lock 0x%08x fattened\n",
-                         threadId, (uint)&obj->lock);
-
-                /* Fall through to acquire the newly fat lock.
-                 */
+                } else {
+                    /*
+                     * The thin lock was inflated by another thread.
+                     * Let the VM know we are no longer waiting and
+                     * try again.
+                     */
+                    LOG_THIN("(%d) lock %p surprise-fattened",
+                             threadId, &obj->lock);
+                    dvmChangeStatus(self, oldStatus);
+                    goto retry;
+                }
             }
-
-            /* The lock is already fat, which means
-             * that obj->lock.mon is a regular (Monitor *).
+            LOG_THIN("(%d) spin on lock done %p: %#x (%#x) %#x",
+                     threadId, &obj->lock, 0, *thinp, thin);
+            /*
+             * We have acquired the thin lock.  Let the VM know that
+             * we are no longer waiting.
              */
-        fat_lock:
-            assert(obj->lock.mon != NULL);
-            lockMonitor(self, obj->lock.mon);
+            dvmChangeStatus(self, oldStatus);
+            /*
+             * Fatten the lock.
+             */
+            mon = dvmCreateMonitor(obj);
+            lockMonitor(self, mon);
+            thin = *thinp;
+            thin &= LW_HASH_STATE_MASK << LW_HASH_STATE_SHIFT;
+            thin |= (u4)mon | LW_SHAPE_FAT;
+            MEM_BARRIER();
+            obj->lock = thin;
+            LOG_THIN("(%d) lock %p fattened", threadId, &obj->lock);
         }
+    } else {
+        /*
+         * The lock is a fat lock.
+         */
+        assert(LW_MONITOR(obj->lock) != NULL);
+        lockMonitor(self, LW_MONITOR(obj->lock));
     }
-    // else, the lock was acquired with the ATOMIC_CMP_SWAP().
-
 #ifdef WITH_DEADLOCK_PREDICTION
     /*
      * See if we were allowed to grab the lock at this time.  We do it
@@ -901,41 +1069,59 @@ void dvmLockObject(Thread* self, Object *obj)
  */
 bool dvmUnlockObject(Thread* self, Object *obj)
 {
-    volatile u4 *thinp = &obj->lock.thin;
-    u4 threadId = self->threadId;
+    u4 thin;
 
-    /* Check the common case, where 'self' has locked 'obj' once, first.
+    assert(self != NULL);
+    assert(self->status == THREAD_RUNNING);
+    assert(obj != NULL);
+    /*
+     * Cache the lock word as its value can change while we are
+     * examining its state.
      */
-    if (*thinp == threadId) {
-        /* Unlock 'obj' by clearing our threadId from 'thin'.
-         * The lock protects the lock field itself, so it's
-         * safe to update non-atomically.
+    thin = obj->lock;
+    if (LW_SHAPE(thin) == LW_SHAPE_THIN) {
+        /*
+         * The lock is thin.  We must ensure that the lock is owned
+         * by the given thread before unlocking it.
          */
-        *thinp = DVM_LOCK_INITIAL_THIN_VALUE;
-    } else if ((*thinp & 1) != 0) {
-        /* If the object is locked, it had better be locked by us.
-         */
-        if ((*thinp & 0xffff) != threadId) {
-            /* The JNI spec says that we should throw an exception
-             * in this case.
+        if (LW_LOCK_OWNER(thin) == self->threadId) {
+            /*
+             * We are the lock owner.  It is safe to update the lock
+             * without CAS as lock ownership guards the lock itself.
              */
-            //LOGW("Unlock thin %p: id %d vs %d\n",
-            //    obj, (*thinp & 0xfff), threadId);
+            if (LW_LOCK_COUNT(thin) == 0) {
+                /*
+                 * The lock was not recursively acquired, the common
+                 * case.  Unlock by clearing all bits except for the
+                 * hash state.
+                 */
+                obj->lock &= (LW_HASH_STATE_MASK << LW_HASH_STATE_SHIFT);
+            } else {
+                /*
+                 * The object was recursively acquired.  Decrement the
+                 * lock recursion count field.
+                 */
+                obj->lock -= 1 << LW_LOCK_COUNT_SHIFT;
+            }
+        } else {
+            /*
+             * We do not own the lock.  The JVM spec requires that we
+             * throw an exception in this case.
+             */
             dvmThrowException("Ljava/lang/IllegalMonitorStateException;",
-                "unlock of unowned monitor");
+                              "unlock of unowned monitor");
             return false;
         }
-
-        /* It's a thin lock, but 'self' has locked 'obj'
-         * more than once.  Decrement the count.
-         */
-        *thinp -= 1<<16;
     } else {
-        /* It's a fat lock.
+        /*
+         * The lock is fat.  We must check to see if unlockMonitor has
+         * raised any exceptions before continuing.
          */
-        assert(obj->lock.mon != NULL);
-        if (!unlockMonitor(self, obj->lock.mon)) {
-            /* exception has been raised */
+        assert(LW_MONITOR(obj->lock) != NULL);
+        if (!unlockMonitor(self, LW_MONITOR(obj->lock))) {
+            /*
+             * An exception has been raised.  Do not fall through.
+             */
             return false;
         }
     }
@@ -956,15 +1142,16 @@ bool dvmUnlockObject(Thread* self, Object *obj)
 void dvmObjectWait(Thread* self, Object *obj, s8 msec, s4 nsec,
     bool interruptShouldThrow)
 {
-    Monitor* mon = obj->lock.mon;
-    u4 thin = obj->lock.thin;
+    Monitor* mon = LW_MONITOR(obj->lock);
+    u4 hashState;
+    u4 thin = obj->lock;
 
     /* If the lock is still thin, we need to fatten it.
      */
-    if ((thin & 1) != 0) {
+    if (LW_SHAPE(thin) == LW_SHAPE_THIN) {
         /* Make sure that 'self' holds the lock.
          */
-        if ((thin & 0xffff) != self->threadId) {
+        if (LW_LOCK_OWNER(thin) != self->threadId) {
             dvmThrowException("Ljava/lang/IllegalMonitorStateException;",
                 "object not locked by thread before wait()");
             return;
@@ -981,13 +1168,17 @@ void dvmObjectWait(Thread* self, Object *obj, s8 msec, s4 nsec,
          * make sure that the monitor reflects this.
          */
         lockMonitor(self, mon);
-        mon->lockCount = thin >> 16;
+        mon->lockCount = LW_LOCK_COUNT(thin);
         LOG_THIN("(%d) lock 0x%08x fattened by wait() to count %d\n",
                  self->threadId, (uint)&obj->lock, mon->lockCount);
 
+
         /* Make the monitor public now that it's in the right state.
          */
-        obj->lock.mon = mon;
+        thin &= LW_HASH_STATE_MASK << LW_HASH_STATE_SHIFT;
+        thin |= (u4)mon | LW_SHAPE_FAT;
+        MEM_BARRIER();
+        obj->lock = thin;
     }
 
     waitMonitor(self, mon, msec, nsec, interruptShouldThrow);
@@ -998,16 +1189,15 @@ void dvmObjectWait(Thread* self, Object *obj, s8 msec, s4 nsec,
  */
 void dvmObjectNotify(Thread* self, Object *obj)
 {
-    Monitor* mon = obj->lock.mon;
-    u4 thin = obj->lock.thin;
+    u4 thin = obj->lock;
 
     /* If the lock is still thin, there aren't any waiters;
      * waiting on an object forces lock fattening.
      */
-    if ((thin & 1) != 0) {
+    if (LW_SHAPE(thin) == LW_SHAPE_THIN) {
         /* Make sure that 'self' holds the lock.
          */
-        if ((thin & 0xffff) != self->threadId) {
+        if (LW_LOCK_OWNER(thin) != self->threadId) {
             dvmThrowException("Ljava/lang/IllegalMonitorStateException;",
                 "object not locked by thread before notify()");
             return;
@@ -1018,7 +1208,7 @@ void dvmObjectNotify(Thread* self, Object *obj)
     } else {
         /* It's a fat lock.
          */
-        notifyMonitor(self, mon);
+        notifyMonitor(self, LW_MONITOR(thin));
     }
 }
 
@@ -1027,15 +1217,15 @@ void dvmObjectNotify(Thread* self, Object *obj)
  */
 void dvmObjectNotifyAll(Thread* self, Object *obj)
 {
-    u4 thin = obj->lock.thin;
+    u4 thin = obj->lock;
 
     /* If the lock is still thin, there aren't any waiters;
      * waiting on an object forces lock fattening.
      */
-    if ((thin & 1) != 0) {
+    if (LW_SHAPE(thin) == LW_SHAPE_THIN) {
         /* Make sure that 'self' holds the lock.
          */
-        if ((thin & 0xffff) != self->threadId) {
+        if (LW_LOCK_OWNER(thin) != self->threadId) {
             dvmThrowException("Ljava/lang/IllegalMonitorStateException;",
                 "object not locked by thread before notifyAll()");
             return;
@@ -1044,81 +1234,11 @@ void dvmObjectNotifyAll(Thread* self, Object *obj)
         /* no-op;  there are no waiters to notify.
          */
     } else {
-        Monitor* mon = obj->lock.mon;
-
         /* It's a fat lock.
          */
-        notifyAllMonitor(self, mon);
+        notifyAllMonitor(self, LW_MONITOR(thin));
     }
 }
-
-#else  // not THIN_LOCKING
-
-/*
- * Implements monitorenter for "synchronized" stuff.
- *
- * This does not fail or throw an exception.
- */
-void dvmLockObject(Thread* self, Object* obj)
-{
-    Monitor* mon = obj->lock.mon;
-
-    if (mon == NULL) {
-        mon = dvmCreateMonitor(obj);
-        if (!ATOMIC_CMP_SWAP((int32_t *)&obj->lock.mon,
-                             (int32_t)NULL, (int32_t)mon)) {
-            /* somebody else beat us to it */
-            releaseMonitor(mon);
-            mon = obj->lock.mon;
-        }
-    }
-
-    lockMonitor(self, mon);
-}
-
-/*
- * Implements monitorexit for "synchronized" stuff.
- */
-bool dvmUnlockObject(Thread* self, Object* obj)
-{
-    Monitor* mon = obj->lock.mon;
-
-    return unlockMonitor(self, mon);
-}
-
-
-/*
- * Object.wait().
- */
-void dvmObjectWait(Thread* self, Object* obj, u8 msec, u4 nsec)
-{
-    Monitor* mon = obj->lock.mon;
-
-    waitMonitor(self, mon, msec, nsec);
-}
-
-/*
- * Object.notify().
- */
-void dvmObjectNotify(Thread* self, Object* obj)
-{
-    Monitor* mon = obj->lock.mon;
-
-    notifyMonitor(self, mon);
-}
-
-/*
- * Object.notifyAll().
- */
-void dvmObjectNotifyAll(Thread* self, Object* obj)
-{
-    Monitor* mon = obj->lock.mon;
-
-    notifyAllMonitor(self, mon);
-}
-
-#endif  // not THIN_LOCKING
-
 
 /*
  * This implements java.lang.Thread.sleep(long msec, int nsec).
@@ -1150,20 +1270,21 @@ void dvmThreadSleep(u8 msec, u4 nsec)
 
 /*
  * Implement java.lang.Thread.interrupt().
- *
- * We need to increment the monitor's "interrupting" count, and set the
- * interrupted status for the thread in question.  Doing so requires
- * gaining the monitor's lock, which may not happen in a timely fashion.
- * We are left with a decision between failing to interrupt the thread
- * and stalling the interrupting thread.
- *
- * We must take some care to ensure that we don't try to interrupt the same
- * thread on the same mutex twice.  Doing so would leave us with an
- * incorrect value for Monitor.interrupting.
  */
-void dvmThreadInterrupt(volatile Thread* thread)
+void dvmThreadInterrupt(Thread* thread)
 {
-    Monitor* mon;
+    assert(thread != NULL);
+
+    pthread_mutex_lock(&thread->waitMutex);
+
+    /*
+     * If the interrupted flag is already set no additional action is
+     * required.
+     */
+    if (thread->interrupted == true) {
+        pthread_mutex_unlock(&thread->waitMutex);
+        return;
+    }
 
     /*
      * Raise the "interrupted" flag.  This will cause it to bail early out
@@ -1180,81 +1301,203 @@ void dvmThreadInterrupt(volatile Thread* thread)
      * is only set when a thread actually waits on a monitor,
      * which implies that the monitor has already been fattened.
      */
-    mon = thread->waitMonitor;
-    if (mon == NULL)
-        return;
-
-    /*
-     * Try to acquire the monitor, if we don't already own it.  We need
-     * to hold the same mutex as the thread in order to signal the
-     * condition it's waiting on.  When the thread goes to sleep it will
-     * release the monitor's mutex, allowing us to signal it.
-     *
-     * TODO: we may be able to get rid of the explicit lock by coordinating
-     * this more closely with waitMonitor.
-     */
-    Thread* self = dvmThreadSelf();
-    if (!tryLockMonitor(self, mon)) {
-        /*
-         * Failed to get the monitor the thread is waiting on; most likely
-         * the other thread is in the middle of doing something.
-         */
-        const int kSpinSleepTime = 500*1000;        /* 0.5s */
-        u8 startWhen = dvmGetRelativeTimeUsec();
-        int sleepIter = 0;
-
-        while (dvmIterativeSleep(sleepIter++, kSpinSleepTime, startWhen)) {
-            /*
-             * Still time left on the clock, try to grab it again.
-             */
-            if (tryLockMonitor(self, mon))
-                goto gotit;
-
-            /*
-             * If the target thread is no longer waiting on the same monitor,
-             * the "interrupted" flag we set earlier will have caused the
-             * interrupt when the thread woke up, so we can stop now.
-             */
-            if (thread->waitMonitor != mon)
-                return;
-        }
-
-        /*
-         * We have to give up or risk deadlock.
-         */
-        LOGW("threadid=%d: unable to interrupt threadid=%d\n",
-            self->threadId, thread->threadId);
-        return;
+    if (thread->waitMonitor != NULL) {
+        pthread_cond_signal(&thread->waitCond);
     }
 
-gotit:
-    /*
-     * We've got the monitor lock, which means nobody can be added or
-     * removed from the wait list.  This also means that the Thread's
-     * waitMonitor/interruptingWait fields can't be modified by anyone
-     * else.
-     *
-     * If things look good, raise flags and wake the threads sleeping
-     * on the monitor's condition variable.
-     */
-    if (thread->waitMonitor == mon &&       // still on same monitor?
-        thread->interrupted &&              // interrupt still pending?
-        !thread->interruptingWait)          // nobody else is interrupting too?
-    {
-        int cc;
-
-        LOGVV("threadid=%d: interrupting threadid=%d waiting on %p\n",
-            self->threadId, thread->threadId, mon);
-
-        thread->interruptingWait = true;    // prevent re-interrupt...
-        mon->interrupting++;                // ...so we only do this once
-        cc = pthread_cond_broadcast(&mon->cond);
-        assert(cc == 0);
-    }
-
-    unlockMonitor(self, mon);
+    pthread_mutex_unlock(&thread->waitMutex);
 }
 
+#ifndef WITH_COPYING_GC
+u4 dvmIdentityHashCode(Object *obj)
+{
+    return (u4)obj;
+}
+#else
+static size_t arrayElementWidth(const ArrayObject *array)
+{
+    const char *descriptor;
+
+    if (dvmIsObjectArray(array)) {
+	return sizeof(Object *);
+    } else {
+	descriptor = array->obj.clazz->descriptor;
+        switch (descriptor[1]) {
+        case 'B': return 1;  /* byte */
+        case 'C': return 2;  /* char */
+        case 'D': return 8;  /* double */
+        case 'F': return 4;  /* float */
+        case 'I': return 4;  /* int */
+        case 'J': return 8;  /* long */
+        case 'S': return 2;  /* short */
+        case 'Z': return 1;  /* boolean */
+        }
+    }
+    LOGE("object %p has an unhandled descriptor '%s'", array, descriptor);
+    dvmDumpThread(dvmThreadSelf(), false);
+    dvmAbort();
+    return 0;  /* Quiet the compiler. */
+}
+
+static size_t arrayObjectLength(const ArrayObject *array)
+{
+    size_t length;
+
+    length = offsetof(ArrayObject, contents);
+    length += array->length * arrayElementWidth(array);
+    return length;
+}
+
+/*
+ * Returns the identity hash code of the given object.
+ */
+u4 dvmIdentityHashCode(Object *obj)
+{
+    Thread *self, *thread;
+    volatile u4 *lw;
+    size_t length;
+    u4 lock, owner, hashState;
+
+    if (obj == NULL) {
+        /*
+         * Null is defined to have an identity hash code of 0.
+         */
+        return 0;
+    }
+    lw = &obj->lock;
+retry:
+    hashState = LW_HASH_STATE(*lw);
+    if (hashState == LW_HASH_STATE_HASHED) {
+        /*
+         * The object has been hashed but has not had its hash code
+         * relocated by the garbage collector.  Use the raw object
+         * address.
+         */
+        return (u4)obj >> 3;
+    } else if (hashState == LW_HASH_STATE_HASHED_AND_MOVED) {
+        /*
+         * The object has been hashed and its hash code has been
+         * relocated by the collector.  Use the value of the naturally
+         * aligned word following the instance data.
+         */
+        if (IS_CLASS_FLAG_SET(obj->clazz, CLASS_ISARRAY)) {
+            length = arrayObjectLength((ArrayObject *)obj);
+            length = (length + 3) & ~3;
+        } else {
+            length = obj->clazz->objectSize;
+        }
+        return *(u4 *)(((char *)obj) + length);
+    } else if (hashState == LW_HASH_STATE_UNHASHED) {
+        /*
+         * The object has never been hashed.  Change the hash state to
+         * hashed and use the raw object address.
+         */
+        self = dvmThreadSelf();
+        if (self->threadId == lockOwner(obj)) {
+            /*
+             * We already own the lock so we can update the hash state
+             * directly.
+             */
+            *lw |= (LW_HASH_STATE_HASHED << LW_HASH_STATE_SHIFT);
+            return (u4)obj >> 3;
+        }
+        /*
+         * We do not own the lock.  Try acquiring the lock.  Should
+         * this fail, we must suspend the owning thread.
+         */
+        if (LW_SHAPE(*lw) == LW_SHAPE_THIN) {
+            /*
+             * If the lock is thin assume it is unowned.  We simulate
+             * an acquire, update, and release with a single CAS.
+             */
+            lock = DVM_LOCK_INITIAL_THIN_VALUE;
+            lock |= (LW_HASH_STATE_HASHED << LW_HASH_STATE_SHIFT);
+            if (ATOMIC_CMP_SWAP((int32_t *)lw,
+                                (int32_t)DVM_LOCK_INITIAL_THIN_VALUE,
+                                (int32_t)lock)) {
+                /*
+                 * A new lockword has been installed with a hash state
+                 * of hashed.  Use the raw object address.
+                 */
+                return (u4)obj >> 3;
+            }
+        } else {
+            if (tryLockMonitor(self, LW_MONITOR(*lw))) {
+                /*
+                 * The monitor lock has been acquired.  Change the
+                 * hash state to hashed and use the raw object
+                 * address.
+                 */
+                *lw |= (LW_HASH_STATE_HASHED << LW_HASH_STATE_SHIFT);
+                unlockMonitor(self, LW_MONITOR(*lw));
+                return (u4)obj >> 3;
+            }
+        }
+        /*
+         * At this point we have failed to acquire the lock.  We must
+         * identify the owning thread and suspend it.
+         */
+        dvmLockThreadList(self);
+        /*
+         * Cache the lock word as its value can change between
+         * determining its shape and retrieving its owner.
+         */
+        lock = *lw;
+        if (LW_SHAPE(lock) == LW_SHAPE_THIN) {
+            /*
+             * Find the thread with the corresponding thread id.
+             */
+            owner = LW_LOCK_OWNER(lock);
+            assert(owner != self->threadId);
+            /*
+             * If the lock has no owner do not bother scanning the
+             * thread list and fall through to the failure handler.
+             */
+            thread = owner ? gDvm.threadList : NULL;
+            while (thread != NULL) {
+                if (thread->threadId == owner) {
+                    break;
+                }
+                thread = thread->next;
+            }
+        } else {
+            thread = LW_MONITOR(lock)->owner;
+        }
+        /*
+         * If thread is NULL the object has been released since the
+         * thread list lock was acquired.  Try again.
+         */
+        if (thread == NULL) {
+            dvmUnlockThreadList();
+            goto retry;
+        }
+        /*
+         * Wait for the owning thread to suspend.
+         */
+        dvmSuspendThread(thread);
+        if (dvmHoldsLock(thread, obj)) {
+            /*
+             * The owning thread has been suspended.  We can safely
+             * change the hash state to hashed.
+             */
+            *lw |= (LW_HASH_STATE_HASHED << LW_HASH_STATE_SHIFT);
+            dvmResumeThread(thread);
+            dvmUnlockThreadList();
+            return (u4)obj >> 3;
+        }
+        /*
+         * The wrong thread has been suspended.  Try again.
+         */
+        dvmResumeThread(thread);
+        dvmUnlockThreadList();
+        goto retry;
+    }
+    LOGE("object %p has an unknown hash state %#x", obj, hashState);
+    dvmDumpThread(dvmThreadSelf(), false);
+    dvmAbort();
+    return 0;  /* Quiet the compiler. */
+}
+#endif  /* WITH_COPYING_GC */
 
 #ifdef WITH_DEADLOCK_PREDICTION
 /*
@@ -1462,13 +1705,13 @@ static int expandObjCheckForDuplicates(const ExpandingObjectList* pList)
  */
 static bool objectInChildList(const Object* parent, Object* child)
 {
-    Lock lock = parent->lock;
+    u4 lock = parent->lock;
     if (!IS_LOCK_FAT(&lock)) {
         //LOGI("on thin\n");
         return false;
     }
 
-    return expandObjHas(&lock.mon->historyChildren, child);
+    return expandObjHas(&LW_MONITOR(lock)->historyChildren, child);
 }
 
 /*
@@ -1476,7 +1719,7 @@ static bool objectInChildList(const Object* parent, Object* child)
  */
 static void dumpKids(Object* parent)
 {
-    Monitor* mon = parent->lock.mon;
+    Monitor* mon = LW_MONITOR(parent->lock);
 
     printf("Children of %p:", parent);
     expandObjDump(&mon->historyChildren);
@@ -1489,17 +1732,17 @@ static void dumpKids(Object* parent)
  */
 static void linkParentToChild(Object* parent, Object* child)
 {
-    //assert(parent->lock.mon->owner == dvmThreadSelf());   // !owned for merge
+    //assert(LW_MONITOR(parent->lock)->owner == dvmThreadSelf());   // !owned for merge
     assert(IS_LOCK_FAT(&parent->lock));
     assert(IS_LOCK_FAT(&child->lock));
     assert(parent != child);
     Monitor* mon;
 
-    mon = parent->lock.mon;
+    mon = LW_MONITOR(parent->lock);
     assert(!expandObjHas(&mon->historyChildren, child));
     expandObjAddEntry(&mon->historyChildren, child);
 
-    mon = child->lock.mon;
+    mon = LW_MONITOR(child->lock);
     assert(!expandObjHas(&mon->historyParents, parent));
     expandObjAddEntry(&mon->historyParents, parent);
 }
@@ -1510,20 +1753,20 @@ static void linkParentToChild(Object* parent, Object* child)
  */
 static void unlinkParentFromChild(Object* parent, Object* child)
 {
-    //assert(parent->lock.mon->owner == dvmThreadSelf());   // !owned for GC
+    //assert(LW_MONITOR(parent->lock)->owner == dvmThreadSelf());   // !owned for GC
     assert(IS_LOCK_FAT(&parent->lock));
     assert(IS_LOCK_FAT(&child->lock));
     assert(parent != child);
     Monitor* mon;
 
-    mon = parent->lock.mon;
+    mon = LW_MONITOR(parent->lock);
     if (!expandObjRemoveEntry(&mon->historyChildren, child)) {
         LOGW("WARNING: child %p not found in parent %p\n", child, parent);
     }
     assert(!expandObjHas(&mon->historyChildren, child));
     assert(expandObjCheckForDuplicates(&mon->historyChildren) < 0);
 
-    mon = child->lock.mon;
+    mon = LW_MONITOR(child->lock);
     if (!expandObjRemoveEntry(&mon->historyParents, parent)) {
         LOGW("WARNING: parent %p not found in child %p\n", parent, child);
     }
@@ -1566,7 +1809,7 @@ static void logHeldMonitors(Thread* self)
 static bool traverseTree(Thread* self, const Object* obj)
 {
     assert(IS_LOCK_FAT(&obj->lock));
-    Monitor* mon = obj->lock.mon;
+    Monitor* mon = LW_MONITOR(obj->lock);
 
     /*
      * Have we been here before?
@@ -1610,7 +1853,7 @@ static bool traverseTree(Thread* self, const Object* obj)
     int i;
     for (i = expandBufGetCount(pList)-1; i >= 0; i--) {
         const Object* child = expandBufGetEntry(pList, i);
-        Lock lock = child->lock;
+        u4 lock = child->lock;
         if (!IS_LOCK_FAT(&lock))
             continue;
         if (!traverseTree(self, child)) {
@@ -1667,16 +1910,17 @@ static void updateDeadlockPrediction(Thread* self, Object* acqObj)
      */
     if (!IS_LOCK_FAT(&acqObj->lock)) {
         LOGVV("fattening lockee %p (recur=%d)\n",
-            acqObj, acqObj->lock.thin >> 16);
+            acqObj, LW_LOCK_COUNT(acqObj->lock.thin));
         Monitor* newMon = dvmCreateMonitor(acqObj);
         lockMonitor(self, newMon);      // can't stall, don't need VMWAIT
-        newMon->lockCount += acqObj->lock.thin >> 16;
-        acqObj->lock.mon = newMon;
+        newMon->lockCount += LW_LOCK_COUNT(acqObj->lock);
+        u4 hashState = LW_HASH_STATE(acqObj->lock) << LW_HASH_STATE_SHIFT;
+        acqObj->lock = (u4)newMon | hashState | LW_SHAPE_FAT;
     }
 
     /* if we don't have a stack trace for this monitor, establish one */
-    if (acqObj->lock.mon->historyRawStackTrace == NULL) {
-        Monitor* mon = acqObj->lock.mon;
+    if (LW_MONITOR(acqObj->lock)->historyRawStackTrace == NULL) {
+        Monitor* mon = LW_MONITOR(acqObj->lock);
         mon->historyRawStackTrace = dvmFillInStackTraceRaw(self,
             &mon->historyStackDepth);
     }
@@ -1714,11 +1958,12 @@ static void updateDeadlockPrediction(Thread* self, Object* acqObj)
      */
     if (!IS_LOCK_FAT(&mrl->obj->lock)) {
         LOGVV("fattening parent %p f/b/o child %p (recur=%d)\n",
-            mrl->obj, acqObj, mrl->obj->lock.thin >> 16);
+            mrl->obj, acqObj, LW_LOCK_COUNT(mrl->obj->lock));
         Monitor* newMon = dvmCreateMonitor(mrl->obj);
         lockMonitor(self, newMon);      // can't stall, don't need VMWAIT
-        newMon->lockCount += mrl->obj->lock.thin >> 16;
-        mrl->obj->lock.mon = newMon;
+        newMon->lockCount += LW_LOCK_COUNT(mrl->obj->lock);
+        u4 hashState = LW_HASH_STATE(mrl->obj->lock) << LW_HASH_STATE_SHIFT;
+        mrl->obj->lock = (u4)newMon | hashState | LW_SHAPE_FAT;
     }
 
     /*
@@ -1781,7 +2026,7 @@ static void mergeChildren(Object* parent, const Object* child)
     int i;
 
     assert(IS_LOCK_FAT(&child->lock));
-    mon = child->lock.mon;
+    mon = LW_MONITOR(child->lock);
     ExpandingObjectList* pList = &mon->historyChildren;
 
     for (i = expandBufGetCount(pList)-1; i >= 0; i--) {
@@ -1840,11 +2085,11 @@ static void removeCollectedObject(Object* obj)
     int i;
 
     assert(IS_LOCK_FAT(&obj->lock));
-    mon = obj->lock.mon;
+    mon = LW_MONITOR(obj->lock);
     pList = &mon->historyParents;
     for (i = expandBufGetCount(pList)-1; i >= 0; i--) {
         Object* parent = expandBufGetEntry(pList, i);
-        Monitor* parentMon = parent->lock.mon;
+        Monitor* parentMon = LW_MONITOR(parent->lock);
 
         if (!expandObjRemoveEntry(&parentMon->historyChildren, obj)) {
             LOGW("WARNING: child %p not found in parent %p\n", obj, parent);
@@ -1861,7 +2106,7 @@ static void removeCollectedObject(Object* obj)
     pList = &mon->historyChildren;
     for (i = expandBufGetCount(pList)-1; i >= 0; i--) {
         Object* child = expandBufGetEntry(pList, i);
-        Monitor* childMon = child->lock.mon;
+        Monitor* childMon = LW_MONITOR(child->lock);
 
         if (!expandObjRemoveEntry(&childMon->historyParents, obj)) {
             LOGW("WARNING: parent %p not found in child %p\n", obj, child);
@@ -1871,4 +2116,3 @@ static void removeCollectedObject(Object* obj)
 }
 
 #endif /*WITH_DEADLOCK_PREDICTION*/
-

@@ -936,6 +936,7 @@ const u1* dvmRegisterMapGetLine(const RegisterMap* pMap, int addr)
 
             data += lineWidth;
         }
+        assert(data == pMap->data + lineWidth * numEntries);
     } else {
         int hi, lo, mid;
 
@@ -960,7 +961,6 @@ const u1* dvmRegisterMapGetLine(const RegisterMap* pMap, int addr)
         }
     }
 
-    assert(data == pMap->data + lineWidth * numEntries);
     return NULL;
 }
 
@@ -1036,6 +1036,7 @@ const RegisterMap* dvmGetExpandedRegisterMap0(Method* method)
     default:
         LOGE("Unknown format %d in dvmGetExpandedRegisterMap\n", format);
         dvmAbort();
+        newMap = NULL;      // make gcc happy
     }
 
     if (newMap == NULL) {
@@ -2999,6 +3000,7 @@ sget_1nr_common:
      * quickened.  This is feasible but not currently supported.
      */
     case OP_EXECUTE_INLINE:
+    case OP_EXECUTE_INLINE_RANGE:
     case OP_INVOKE_DIRECT_EMPTY:
     case OP_IGET_QUICK:
     case OP_IGET_WIDE_QUICK:
@@ -3033,9 +3035,8 @@ sget_1nr_common:
     case OP_UNUSED_E9:
     case OP_UNUSED_EA:
     case OP_UNUSED_EB:
-    case OP_UNUSED_EC:
+    case OP_BREAKPOINT:
     case OP_UNUSED_ED:
-    case OP_UNUSED_EF:
     case OP_UNUSED_F1:
     case OP_UNUSED_FC:
     case OP_UNUSED_FD:

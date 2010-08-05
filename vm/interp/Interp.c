@@ -35,16 +35,368 @@
  * ===========================================================================
  */
 
+// fwd
+static BreakpointSet* dvmBreakpointSetAlloc(void);
+static void dvmBreakpointSetFree(BreakpointSet* pSet);
+
 /*
- * Initialize the breakpoint address lookup table when the debugger attaches.
+ * Initialize global breakpoint structures.
+ */
+bool dvmBreakpointStartup(void)
+{
+#ifdef WITH_DEBUGGER
+    gDvm.breakpointSet = dvmBreakpointSetAlloc();
+    return (gDvm.breakpointSet != NULL);
+#else
+    return true;
+#endif
+}
+
+/*
+ * Free resources.
+ */
+void dvmBreakpointShutdown(void)
+{
+#ifdef WITH_DEBUGGER
+    dvmBreakpointSetFree(gDvm.breakpointSet);
+#endif
+}
+
+
+#ifdef WITH_DEBUGGER
+/*
+ * This represents a breakpoint inserted in the instruction stream.
  *
- * This shouldn't be necessary -- the global area is initially zeroed out,
- * and the events should be cleaning up after themselves.
+ * The debugger may ask us to create the same breakpoint multiple times.
+ * We only remove the breakpoint when the last instance is cleared.
+ */
+typedef struct {
+    Method*     method;                 /* method we're associated with */
+    u2*         addr;                   /* absolute memory address */
+    u1          originalOpCode;         /* original 8-bit opcode value */
+    int         setCount;               /* #of times this breakpoint was set */
+} Breakpoint;
+
+/*
+ * Set of breakpoints.
+ */
+struct BreakpointSet {
+    /* grab lock before reading or writing anything else in here */
+    pthread_mutex_t lock;
+
+    /* vector of breakpoint structures */
+    int         alloc;
+    int         count;
+    Breakpoint* breakpoints;
+};
+
+/*
+ * Initialize a BreakpointSet.  Initially empty.
+ */
+static BreakpointSet* dvmBreakpointSetAlloc(void)
+{
+    BreakpointSet* pSet = (BreakpointSet*) calloc(1, sizeof(*pSet));
+
+    dvmInitMutex(&pSet->lock);
+    /* leave the rest zeroed -- will alloc on first use */
+
+    return pSet;
+}
+
+/*
+ * Free storage associated with a BreakpointSet.
+ */
+static void dvmBreakpointSetFree(BreakpointSet* pSet)
+{
+    if (pSet == NULL)
+        return;
+
+    free(pSet->breakpoints);
+    free(pSet);
+}
+
+/*
+ * Lock the breakpoint set.
+ *
+ * It's not currently necessary to switch to VMWAIT in the event of
+ * contention, because nothing in here can block.  However, it's possible
+ * that the bytecode-updater code could become fancier in the future, so
+ * we do the trylock dance as a bit of future-proofing.
+ */
+static void dvmBreakpointSetLock(BreakpointSet* pSet)
+{
+    if (dvmTryLockMutex(&pSet->lock) != 0) {
+        Thread* self = dvmThreadSelf();
+        int oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
+        dvmLockMutex(&pSet->lock);
+        dvmChangeStatus(self, oldStatus);
+    }
+}
+
+/*
+ * Unlock the breakpoint set.
+ */
+static void dvmBreakpointSetUnlock(BreakpointSet* pSet)
+{
+    dvmUnlockMutex(&pSet->lock);
+}
+
+/*
+ * Return the #of breakpoints.
+ */
+static int dvmBreakpointSetCount(const BreakpointSet* pSet)
+{
+    return pSet->count;
+}
+
+/*
+ * See if we already have an entry for this address.
+ *
+ * The BreakpointSet's lock must be acquired before calling here.
+ *
+ * Returns the index of the breakpoint entry, or -1 if not found.
+ */
+static int dvmBreakpointSetFind(const BreakpointSet* pSet, const u2* addr)
+{
+    int i;
+
+    for (i = 0; i < pSet->count; i++) {
+        Breakpoint* pBreak = &pSet->breakpoints[i];
+        if (pBreak->addr == addr)
+            return i;
+    }
+
+    return -1;
+}
+
+/*
+ * Retrieve the opcode that was originally at the specified location.
+ *
+ * The BreakpointSet's lock must be acquired before calling here.
+ *
+ * Returns "true" with the opcode in *pOrig on success.
+ */
+static bool dvmBreakpointSetOriginalOpCode(const BreakpointSet* pSet,
+    const u2* addr, u1* pOrig)
+{
+    int idx = dvmBreakpointSetFind(pSet, addr);
+    if (idx < 0)
+        return false;
+
+    *pOrig = pSet->breakpoints[idx].originalOpCode;
+    return true;
+}
+
+/*
+ * Check the opcode.  If it's a "magic" NOP, indicating the start of
+ * switch or array data in the instruction stream, we don't want to set
+ * a breakpoint.
+ *
+ * This can happen because the line number information dx generates
+ * associates the switch data with the switch statement's line number,
+ * and some debuggers put breakpoints at every address associated with
+ * a given line.  The result is that the breakpoint stomps on the NOP
+ * instruction that doubles as a data table magic number, and an explicit
+ * check in the interpreter results in an exception being thrown.
+ *
+ * We don't want to simply refuse to add the breakpoint to the table,
+ * because that confuses the housekeeping.  We don't want to reject the
+ * debugger's event request, and we want to be sure that there's exactly
+ * one un-set operation for every set op.
+ */
+static bool instructionIsMagicNop(const u2* addr)
+{
+    u2 curVal = *addr;
+    return ((curVal & 0xff) == OP_NOP && (curVal >> 8) != 0);
+}
+
+/*
+ * Add a breakpoint at a specific address.  If the address is already
+ * present in the table, this just increments the count.
+ *
+ * For a new entry, this will extract and preserve the current opcode from
+ * the instruction stream, and replace it with a breakpoint opcode.
+ *
+ * The BreakpointSet's lock must be acquired before calling here.
+ *
+ * Returns "true" on success.
+ */
+static bool dvmBreakpointSetAdd(BreakpointSet* pSet, Method* method,
+    unsigned int instrOffset)
+{
+    const int kBreakpointGrowth = 10;
+    const u2* addr = method->insns + instrOffset;
+    int idx = dvmBreakpointSetFind(pSet, addr);
+    Breakpoint* pBreak;
+
+    if (idx < 0) {
+        if (pSet->count == pSet->alloc) {
+            int newSize = pSet->alloc + kBreakpointGrowth;
+            Breakpoint* newVec;
+
+            LOGV("+++ increasing breakpoint set size to %d\n", newSize);
+
+            /* pSet->breakpoints will be NULL on first entry */
+            newVec = realloc(pSet->breakpoints, newSize * sizeof(Breakpoint));
+            if (newVec == NULL)
+                return false;
+
+            pSet->breakpoints = newVec;
+            pSet->alloc = newSize;
+        }
+
+        pBreak = &pSet->breakpoints[pSet->count++];
+        pBreak->method = method;
+        pBreak->addr = (u2*)addr;
+        pBreak->originalOpCode = *(u1*)addr;
+        pBreak->setCount = 1;
+
+        /*
+         * Change the opcode.  We must ensure that the BreakpointSet
+         * updates happen before we change the opcode.
+         *
+         * If the method has not been verified, we do NOT insert the
+         * breakpoint yet, since that will screw up the verifier.  The
+         * debugger is allowed to insert breakpoints in unverified code,
+         * but since we don't execute unverified code we don't need to
+         * alter the bytecode yet.
+         *
+         * The class init code will "flush" all relevant breakpoints when
+         * verification completes.
+         */
+        MEM_BARRIER();
+        assert(*(u1*)addr != OP_BREAKPOINT);
+        if (dvmIsClassVerified(method->clazz)) {
+            LOGV("Class %s verified, adding breakpoint at %p\n",
+                method->clazz->descriptor, addr);
+            if (instructionIsMagicNop(addr)) {
+                LOGV("Refusing to set breakpoint on %04x at %s.%s + 0x%x\n",
+                    *addr, method->clazz->descriptor, method->name,
+                    instrOffset);
+            } else {
+                dvmDexChangeDex1(method->clazz->pDvmDex, (u1*)addr,
+                    OP_BREAKPOINT);
+            }
+        } else {
+            LOGV("Class %s NOT verified, deferring breakpoint at %p\n",
+                method->clazz->descriptor, addr);
+        }
+    } else {
+        pBreak = &pSet->breakpoints[idx];
+        pBreak->setCount++;
+
+        /*
+         * Instruction stream may not have breakpoint opcode yet -- flush
+         * may be pending during verification of class.
+         */
+        //assert(*(u1*)addr == OP_BREAKPOINT);
+    }
+
+    return true;
+}
+
+/*
+ * Remove one instance of the specified breakpoint.  When the count
+ * reaches zero, the entry is removed from the table, and the original
+ * opcode is restored.
+ *
+ * The BreakpointSet's lock must be acquired before calling here.
+ */
+static void dvmBreakpointSetRemove(BreakpointSet* pSet, Method* method,
+    unsigned int instrOffset)
+{
+    const u2* addr = method->insns + instrOffset;
+    int idx = dvmBreakpointSetFind(pSet, addr);
+
+    if (idx < 0) {
+        /* breakpoint not found in set -- unexpected */
+        if (*(u1*)addr == OP_BREAKPOINT) {
+            LOGE("Unable to restore breakpoint opcode (%s.%s +0x%x)\n",
+                method->clazz->descriptor, method->name, instrOffset);
+            dvmAbort();
+        } else {
+            LOGW("Breakpoint was already restored? (%s.%s +0x%x)\n",
+                method->clazz->descriptor, method->name, instrOffset);
+        }
+    } else {
+        Breakpoint* pBreak = &pSet->breakpoints[idx];
+        if (pBreak->setCount == 1) {
+            /*
+             * Must restore opcode before removing set entry.
+             *
+             * If the breakpoint was never flushed, we could be ovewriting
+             * a value with the same value.  Not a problem, though we
+             * could end up causing a copy-on-write here when we didn't
+             * need to.  (Not worth worrying about.)
+             */
+            dvmDexChangeDex1(method->clazz->pDvmDex, (u1*)addr,
+                pBreak->originalOpCode);
+            MEM_BARRIER();
+
+            if (idx != pSet->count-1) {
+                /* shift down */
+                memmove(&pSet->breakpoints[idx], &pSet->breakpoints[idx+1],
+                    (pSet->count-1 - idx) * sizeof(pSet->breakpoints[0]));
+            }
+            pSet->count--;
+            pSet->breakpoints[pSet->count].addr = (u2*) 0xdecadead; // debug
+        } else {
+            pBreak->setCount--;
+            assert(pBreak->setCount > 0);
+        }
+    }
+}
+
+/*
+ * Flush any breakpoints associated with methods in "clazz".  We want to
+ * change the opcode, which might not have happened when the breakpoint
+ * was initially set because the class was in the process of being
+ * verified.
+ *
+ * The BreakpointSet's lock must be acquired before calling here.
+ */
+static void dvmBreakpointSetFlush(BreakpointSet* pSet, ClassObject* clazz)
+{
+    int i;
+    for (i = 0; i < pSet->count; i++) {
+        Breakpoint* pBreak = &pSet->breakpoints[i];
+        if (pBreak->method->clazz == clazz) {
+            /*
+             * The breakpoint is associated with a method in this class.
+             * It might already be there or it might not; either way,
+             * flush it out.
+             */
+            LOGV("Flushing breakpoint at %p for %s\n",
+                pBreak->addr, clazz->descriptor);
+            if (instructionIsMagicNop(pBreak->addr)) {
+                const Method* method = pBreak->method;
+                LOGV("Refusing to flush breakpoint on %04x at %s.%s + 0x%x\n",
+                    *pBreak->addr, method->clazz->descriptor,
+                    method->name, pBreak->addr - method->insns);
+            } else {
+                dvmDexChangeDex1(clazz->pDvmDex, (u1*)pBreak->addr,
+                    OP_BREAKPOINT);
+            }
+        }
+    }
+}
+#endif /*WITH_DEBUGGER*/
+
+
+/*
+ * Do any debugger-attach-time initialization.
  */
 void dvmInitBreakpoints(void)
 {
 #ifdef WITH_DEBUGGER
-    memset(gDvm.debugBreakAddr, 0, sizeof(gDvm.debugBreakAddr));
+    /* quick sanity check */
+    BreakpointSet* pSet = gDvm.breakpointSet;
+    dvmBreakpointSetLock(pSet);
+    if (dvmBreakpointSetCount(pSet) != 0) {
+        LOGW("WARNING: %d leftover breakpoints\n", dvmBreakpointSetCount(pSet));
+        /* generally not good, but we can keep going */
+    }
+    dvmBreakpointSetUnlock(pSet);
 #else
     assert(false);
 #endif
@@ -64,29 +416,13 @@ void dvmInitBreakpoints(void)
  *
  * "addr" is the absolute address of the breakpoint bytecode.
  */
-void dvmAddBreakAddr(Method* method, int instrOffset)
+void dvmAddBreakAddr(Method* method, unsigned int instrOffset)
 {
 #ifdef WITH_DEBUGGER
-    const u2* addr = method->insns + instrOffset;
-    const u2** ptr = gDvm.debugBreakAddr;
-    int i;
-
-    LOGV("BKP: add %p %s.%s (%s:%d)\n",
-        addr, method->clazz->descriptor, method->name,
-        dvmGetMethodSourceFile(method), dvmLineNumFromPC(method, instrOffset));
-
-    method->debugBreakpointCount++;
-    for (i = 0; i < MAX_BREAKPOINTS; i++, ptr++) {
-        if (*ptr == NULL) {
-            *ptr = addr;
-            break;
-        }
-    }
-    if (i == MAX_BREAKPOINTS) {
-        /* no room; size is too small or we're not cleaning up properly */
-        LOGE("ERROR: max breakpoints exceeded\n");
-        assert(false);
-    }
+    BreakpointSet* pSet = gDvm.breakpointSet;
+    dvmBreakpointSetLock(pSet);
+    dvmBreakpointSetAdd(pSet, method, instrOffset);
+    dvmBreakpointSetUnlock(pSet);
 #else
     assert(false);
 #endif
@@ -102,34 +438,61 @@ void dvmAddBreakAddr(Method* method, int instrOffset)
  * synchronized, so it should not be possible for two threads to be
  * updating breakpoints at the same time.
  */
-void dvmClearBreakAddr(Method* method, int instrOffset)
+void dvmClearBreakAddr(Method* method, unsigned int instrOffset)
 {
 #ifdef WITH_DEBUGGER
-    const u2* addr = method->insns + instrOffset;
-    const u2** ptr = gDvm.debugBreakAddr;
-    int i;
+    BreakpointSet* pSet = gDvm.breakpointSet;
+    dvmBreakpointSetLock(pSet);
+    dvmBreakpointSetRemove(pSet, method, instrOffset);
+    dvmBreakpointSetUnlock(pSet);
 
-    LOGV("BKP: clear %p %s.%s (%s:%d)\n",
-        addr, method->clazz->descriptor, method->name,
-        dvmGetMethodSourceFile(method), dvmLineNumFromPC(method, instrOffset));
-
-    method->debugBreakpointCount--;
-    assert(method->debugBreakpointCount >= 0);
-    for (i = 0; i < MAX_BREAKPOINTS; i++, ptr++) {
-        if (*ptr == addr) {
-            *ptr = NULL;
-            break;
-        }
-    }
-    if (i == MAX_BREAKPOINTS) {
-        /* didn't find it */
-        LOGE("ERROR: breakpoint on %p not found\n", addr);
-        assert(false);
-    }
 #else
     assert(false);
 #endif
 }
+
+#ifdef WITH_DEBUGGER
+/*
+ * Get the original opcode from under a breakpoint.
+ */
+u1 dvmGetOriginalOpCode(const u2* addr)
+{
+    BreakpointSet* pSet = gDvm.breakpointSet;
+    u1 orig = 0;
+
+    dvmBreakpointSetLock(pSet);
+    if (!dvmBreakpointSetOriginalOpCode(pSet, addr, &orig)) {
+        orig = *(u1*)addr;
+        if (orig == OP_BREAKPOINT) {
+            LOGE("GLITCH: can't find breakpoint, opcode is still set\n");
+            dvmAbort();
+        }
+    }
+    dvmBreakpointSetUnlock(pSet);
+
+    return orig;
+}
+
+/*
+ * Flush any breakpoints associated with methods in "clazz".
+ *
+ * We don't want to modify the bytecode of a method before the verifier
+ * gets a chance to look at it, so we postpone opcode replacement until
+ * after verification completes.
+ */
+void dvmFlushBreakpoints(ClassObject* clazz)
+{
+    BreakpointSet* pSet = gDvm.breakpointSet;
+
+    if (pSet == NULL)
+        return;
+
+    assert(dvmIsClassVerified(clazz));
+    dvmBreakpointSetLock(pSet);
+    dvmBreakpointSetFlush(pSet, clazz);
+    dvmBreakpointSetUnlock(pSet);
+}
+#endif
 
 /*
  * Add a single step event.  Currently this is a global item.
@@ -458,7 +821,6 @@ s4 dvmInterpHandleSparseSwitch(const u2* switchData, s4 testVal)
     u2 ident, size;
     const s4* keys;
     const s4* entries;
-    int i;
 
     /*
      * Sparse switch data format:
@@ -493,20 +855,23 @@ s4 dvmInterpHandleSparseSwitch(const u2* switchData, s4 testVal)
     assert(((u4)entries & 0x3) == 0);
 
     /*
-     * Run through the list of keys, which are guaranteed to
+     * Binary-search through the array of keys, which are guaranteed to
      * be sorted low-to-high.
-     *
-     * Most tables have 3-4 entries.  Few have more than 10.  A binary
-     * search here is probably not useful.
      */
-    for (i = 0; i < size; i++) {
-        s4 k = s4FromSwitchData(&keys[i]);
-        if (k == testVal) {
+    int lo = 0;
+    int hi = size - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+
+        s4 foundVal = s4FromSwitchData(&keys[mid]);
+        if (testVal < foundVal) {
+            hi = mid - 1;
+        } else if (testVal > foundVal) {
+            lo = mid + 1;
+        } else {
             LOGVV("Value %d found in entry %d (goto 0x%02x)\n",
-                testVal, i, s4FromSwitchData(&entries[i]));
-            return s4FromSwitchData(&entries[i]);
-        } else if (k > testVal) {
-            break;
+                testVal, mid, s4FromSwitchData(&entries[mid]));
+            return s4FromSwitchData(&entries[mid]);
         }
     }
 
@@ -890,13 +1255,20 @@ void dvmInterpret(Thread* self, const Method* method, JValue* pResult)
     InterpState interpState;
     bool change;
 #if defined(WITH_JIT)
+    /* Target-specific save/restore */
+    extern void dvmJitCalleeSave(double *saveArea);
+    extern void dvmJitCalleeRestore(double *saveArea);
     /* Interpreter entry points from compiled code */
     extern void dvmJitToInterpNormal();
     extern void dvmJitToInterpNoChain();
     extern void dvmJitToInterpPunt();
     extern void dvmJitToInterpSingleStep();
-    extern void dvmJitToTraceSelect();
+    extern void dvmJitToInterpTraceSelectNoChain();
+    extern void dvmJitToInterpTraceSelect();
     extern void dvmJitToPatchPredictedChain();
+#if defined(WITH_SELF_VERIFICATION)
+    extern void dvmJitToInterpBackwardBranch();
+#endif
 
     /*
      * Reserve a static entity here to quickly setup runtime contents as
@@ -907,9 +1279,15 @@ void dvmInterpret(Thread* self, const Method* method, JValue* pResult)
         dvmJitToInterpNoChain,
         dvmJitToInterpPunt,
         dvmJitToInterpSingleStep,
-        dvmJitToTraceSelect,
+        dvmJitToInterpTraceSelectNoChain,
+        dvmJitToInterpTraceSelect,
         dvmJitToPatchPredictedChain,
+#if defined(WITH_SELF_VERIFICATION)
+        dvmJitToInterpBackwardBranch,
+#endif
     };
+
+    assert(self->inJitCodeCache == NULL);
 #endif
 
 
@@ -921,7 +1299,9 @@ void dvmInterpret(Thread* self, const Method* method, JValue* pResult)
     interpState.debugIsMethodEntry = true;
 #endif
 #if defined(WITH_JIT)
-    interpState.jitState = gDvmJit.pJitEntryTable ? kJitNormal : kJitOff;
+    dvmJitCalleeSave(interpState.calleeSave);
+    /* Initialize the state to kJitNot */
+    interpState.jitState = kJitNot;
 
     /* Setup the Jit-to-interpreter entry points */
     interpState.jitToInterpEntries = jitToInterpEntries;
@@ -998,4 +1378,7 @@ void dvmInterpret(Thread* self, const Method* method, JValue* pResult)
     }
 
     *pResult = interpState.retval;
+#if defined(WITH_JIT)
+    dvmJitCalleeRestore(interpState.calleeSave);
+#endif
 }

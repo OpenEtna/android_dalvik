@@ -104,8 +104,10 @@ MTERP_OFFSET(offGlue_entryPoint,        MterpGlue, entryPoint, 48)
 #if defined(WITH_JIT)
 MTERP_OFFSET(offGlue_pJitProfTable,     MterpGlue, pJitProfTable, 56)
 MTERP_OFFSET(offGlue_jitState,          MterpGlue, jitState, 60)
-MTERP_OFFSET(offGlue_jitResume,         MterpGlue, jitResume, 64)
-MTERP_OFFSET(offGlue_jitResumePC,       MterpGlue, jitResumePC, 68)
+MTERP_OFFSET(offGlue_jitResumeNPC,      MterpGlue, jitResumeNPC, 64)
+MTERP_OFFSET(offGlue_jitResumeDPC,      MterpGlue, jitResumeDPC, 68)
+MTERP_OFFSET(offGlue_jitThreshold,      MterpGlue, jitThreshold, 72)
+MTERP_OFFSET(offGlue_ppJitProfTable,    MterpGlue, ppJitProfTable, 76)
 #endif
 #elif defined(WITH_DEBUGGER)
 MTERP_OFFSET(offGlue_pDebuggerActive,   MterpGlue, pDebuggerActive, 40)
@@ -113,8 +115,10 @@ MTERP_OFFSET(offGlue_entryPoint,        MterpGlue, entryPoint, 44)
 #if defined(WITH_JIT)
 MTERP_OFFSET(offGlue_pJitProfTable,     MterpGlue, pJitProfTable, 52)
 MTERP_OFFSET(offGlue_jitState,          MterpGlue, jitState, 56)
-MTERP_OFFSET(offGlue_jitResume,         MterpGlue, jitResume, 60)
-MTERP_OFFSET(offGlue_jitResumePC,       MterpGlue, jitResumePC, 64)
+MTERP_OFFSET(offGlue_jitResumeNPC,      MterpGlue, jitResumeNPC, 60)
+MTERP_OFFSET(offGlue_jitResumeDPC,      MterpGlue, jitResumeDPC, 64)
+MTERP_OFFSET(offGlue_jitThreshold,      MterpGlue, jitThreshold, 68)
+MTERP_OFFSET(offGlue_ppJitProfTable,    MterpGlue, ppJitProfTable, 72)
 #endif
 #elif defined(WITH_PROFILER)
 MTERP_OFFSET(offGlue_pActiveProfilers,  MterpGlue, pActiveProfilers, 40)
@@ -122,16 +126,20 @@ MTERP_OFFSET(offGlue_entryPoint,        MterpGlue, entryPoint, 44)
 #if defined(WITH_JIT)
 MTERP_OFFSET(offGlue_pJitProfTable,     MterpGlue, pJitProfTable, 52)
 MTERP_OFFSET(offGlue_jitState,          MterpGlue, jitState, 56)
-MTERP_OFFSET(offGlue_jitResume,         MterpGlue, jitResume, 60)
-MTERP_OFFSET(offGlue_jitResumePC,       MterpGlue, jitResumePC, 64)
+MTERP_OFFSET(offGlue_jitResumeNPC,      MterpGlue, jitResumeNPC, 60)
+MTERP_OFFSET(offGlue_jitResumeDPC,      MterpGlue, jitResumeDPC, 64)
+MTERP_OFFSET(offGlue_jitThreshold,      MterpGlue, jitThreshold, 68)
+MTERP_OFFSET(offGlue_ppJitProfTable,    MterpGlue, ppJitProfTable, 72)
 #endif
 #else
 MTERP_OFFSET(offGlue_entryPoint,        MterpGlue, entryPoint, 40)
 #if defined(WITH_JIT)
 MTERP_OFFSET(offGlue_pJitProfTable,     MterpGlue, pJitProfTable, 48)
 MTERP_OFFSET(offGlue_jitState,          MterpGlue, jitState, 52)
-MTERP_OFFSET(offGlue_jitResume,         MterpGlue, jitResume, 56)
-MTERP_OFFSET(offGlue_jitResumePC,       MterpGlue, jitResumePC, 60)
+MTERP_OFFSET(offGlue_jitResumeNPC,      MterpGlue, jitResumeNPC, 56)
+MTERP_OFFSET(offGlue_jitResumeDPC,      MterpGlue, jitResumeDPC, 60)
+MTERP_OFFSET(offGlue_jitThreshold,      MterpGlue, jitThreshold, 64)
+MTERP_OFFSET(offGlue_ppJitProfTable,    MterpGlue, ppJitProfTable, 68)
 #endif
 #endif
 /* make sure all JValue union members are stored at the same offset */
@@ -169,6 +177,16 @@ MTERP_OFFSET(offStackSaveArea_returnAddr, StackSaveArea, returnAddr, 16)
 MTERP_SIZEOF(sizeofStackSaveArea,       StackSaveArea, 20)
 #endif
 
+  /* ShadowSpace fields */
+#if defined(WITH_JIT) && defined(WITH_SELF_VERIFICATION)
+MTERP_OFFSET(offShadowSpace_startPC, ShadowSpace, startPC, 0)
+MTERP_OFFSET(offShadowSpace_fp, ShadowSpace, fp, 4)
+MTERP_OFFSET(offShadowSpace_glue, ShadowSpace, glue, 8)
+MTERP_OFFSET(offShadowSpace_svState, ShadowSpace, selfVerificationState, 12)
+MTERP_OFFSET(offShadowSpace_shadowFP, ShadowSpace, shadowFP, 20)
+MTERP_OFFSET(offShadowSpace_interpState, ShadowSpace, interpState, 24)
+#endif
+
 /* InstField fields */
 #ifdef PROFILE_FIELD_ACCESS
 MTERP_OFFSET(offInstField_byteOffset,   InstField, byteOffset, 24)
@@ -200,6 +218,17 @@ MTERP_OFFSET(offInlineOperation_func,   InlineOperation, func, 0)
 MTERP_OFFSET(offThread_stackOverflowed, Thread, stackOverflowed, 40)
 MTERP_OFFSET(offThread_curFrame,        Thread, curFrame, 44)
 MTERP_OFFSET(offThread_exception,       Thread, exception, 48)
+
+#if defined(WITH_JIT)
+MTERP_OFFSET(offThread_inJitCodeCache,  Thread, inJitCodeCache, 76)
+#ifdef USE_INDIRECT_REF
+MTERP_OFFSET(offThread_jniLocal_topCookie, \
+                                Thread, jniLocalRefTable.segmentState.all, 80)
+#else
+MTERP_OFFSET(offThread_jniLocal_topCookie, \
+                                Thread, jniLocalRefTable.nextEntry, 80)
+#endif
+#else
 #ifdef USE_INDIRECT_REF
 MTERP_OFFSET(offThread_jniLocal_topCookie, \
                                 Thread, jniLocalRefTable.segmentState.all, 76)
@@ -207,9 +236,15 @@ MTERP_OFFSET(offThread_jniLocal_topCookie, \
 MTERP_OFFSET(offThread_jniLocal_topCookie, \
                                 Thread, jniLocalRefTable.nextEntry, 76)
 #endif
+#endif
 
 /* Object fields */
 MTERP_OFFSET(offObject_clazz,           Object, clazz, 0)
+MTERP_OFFSET(offObject_lock,            Object, lock, 4)
+
+/* Lock shape */
+MTERP_CONSTANT(LW_LOCK_OWNER_SHIFT, 3)
+MTERP_CONSTANT(LW_HASH_STATE_SHIFT, 1)
 
 /* ArrayObject fields */
 MTERP_OFFSET(offArrayObject_length,     ArrayObject, length, 8)
@@ -219,14 +254,34 @@ MTERP_OFFSET(offArrayObject_contents,   ArrayObject, contents, 16)
 MTERP_OFFSET(offArrayObject_contents,   ArrayObject, contents, 12)
 #endif
 
+/* String fields */
+MTERP_CONSTANT(STRING_FIELDOFF_VALUE,     8)
+MTERP_CONSTANT(STRING_FIELDOFF_HASHCODE, 12)
+MTERP_CONSTANT(STRING_FIELDOFF_OFFSET,   16)
+MTERP_CONSTANT(STRING_FIELDOFF_COUNT,    20)
+
+#if defined(WITH_JIT)
+/*
+ * Reasons for the non-chaining interpreter entry points
+ * Enums defined in vm/Globals.h
+ */
+MTERP_CONSTANT(kInlineCacheMiss,        0)
+MTERP_CONSTANT(kCallsiteInterpreted,    1)
+MTERP_CONSTANT(kSwitchOverflow,         2)
+MTERP_CONSTANT(kHeavyweightMonitor,     3)
+
+/* Size of callee save area */
+MTERP_CONSTANT(JIT_CALLEE_SAVE_DOUBLE_COUNT,   8)
+#endif
+
 /* ClassObject fields */
 MTERP_OFFSET(offClassObject_descriptor, ClassObject, descriptor, 24)
 MTERP_OFFSET(offClassObject_accessFlags, ClassObject, accessFlags, 32)
 MTERP_OFFSET(offClassObject_pDvmDex,    ClassObject, pDvmDex, 40)
 MTERP_OFFSET(offClassObject_status,     ClassObject, status, 44)
-MTERP_OFFSET(offClassObject_super,      ClassObject, super, 76)
-MTERP_OFFSET(offClassObject_vtableCount, ClassObject, vtableCount, 116)
-MTERP_OFFSET(offClassObject_vtable,     ClassObject, vtable, 120)
+MTERP_OFFSET(offClassObject_super,      ClassObject, super, 72)
+MTERP_OFFSET(offClassObject_vtableCount, ClassObject, vtableCount, 112)
+MTERP_OFFSET(offClassObject_vtable,     ClassObject, vtable, 116)
 
 /* InterpEntry enumeration */
 MTERP_SIZEOF(sizeofClassStatus,         InterpEntry, MTERP_SMALL_ENUM)
@@ -238,14 +293,28 @@ MTERP_CONSTANT(kInterpEntryResume,  3)
 #endif
 
 #if defined(WITH_JIT)
-MTERP_CONSTANT(kJitOff,             0)
-MTERP_CONSTANT(kJitNormal,          1)
-MTERP_CONSTANT(kJitTSelectRequest,  2)
-MTERP_CONSTANT(kJitTSelect,         3)
-MTERP_CONSTANT(kJitTSelectAbort,    4)
-MTERP_CONSTANT(kJitTSelectEnd,      5)
-MTERP_CONSTANT(kJitSingleStep,      6)
-MTERP_CONSTANT(kJitSingleStepEnd,   7)
+MTERP_CONSTANT(kJitNot,                 0)
+MTERP_CONSTANT(kJitTSelectRequest,      1)
+MTERP_CONSTANT(kJitTSelectRequestHot,   2)
+MTERP_CONSTANT(kJitSelfVerification,    3)
+MTERP_CONSTANT(kJitTSelect,             4)
+MTERP_CONSTANT(kJitTSelectEnd,          5)
+MTERP_CONSTANT(kJitSingleStep,          6)
+MTERP_CONSTANT(kJitSingleStepEnd,       7)
+MTERP_CONSTANT(kJitDone,                8)
+
+#if defined(WITH_SELF_VERIFICATION)
+MTERP_CONSTANT(kSVSIdle, 0)
+MTERP_CONSTANT(kSVSStart, 1)
+MTERP_CONSTANT(kSVSPunt, 2)
+MTERP_CONSTANT(kSVSSingleStep, 3)
+MTERP_CONSTANT(kSVSTraceSelectNoChain, 4)
+MTERP_CONSTANT(kSVSTraceSelect, 5)
+MTERP_CONSTANT(kSVSNormal, 6)
+MTERP_CONSTANT(kSVSNoChain, 7)
+MTERP_CONSTANT(kSVSBackwardBranch, 8)
+MTERP_CONSTANT(kSVSDebugInterp, 9)
+#endif
 #endif
 
 /* ClassStatus enumeration */

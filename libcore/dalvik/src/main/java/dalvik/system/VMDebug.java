@@ -34,6 +34,8 @@ import java.io.IOException;
 public final class VMDebug {
     /**
      * Specifies the default method trace data file name.
+     *
+     * @deprecated only used in one place, which is unused and deprecated
      */
     static public final String DEFAULT_METHOD_TRACE_FILE_NAME = "/sdcard/dmtrace.trace";
 
@@ -44,11 +46,13 @@ public final class VMDebug {
     public static final int TRACE_COUNT_ALLOCS = 1;
 
     /* constants for getAllocCount */
-    private static final int KIND_ALLOCATED_OBJECTS = 1<<0;
-    private static final int KIND_ALLOCATED_BYTES   = 1<<1;
-    private static final int KIND_FREED_OBJECTS     = 1<<2;
-    private static final int KIND_FREED_BYTES       = 1<<3;
-    private static final int KIND_GC_INVOCATIONS    = 1<<4;
+    private static final int KIND_ALLOCATED_OBJECTS     = 1<<0;
+    private static final int KIND_ALLOCATED_BYTES       = 1<<1;
+    private static final int KIND_FREED_OBJECTS         = 1<<2;
+    private static final int KIND_FREED_BYTES           = 1<<3;
+    private static final int KIND_GC_INVOCATIONS        = 1<<4;
+    private static final int KIND_CLASS_INIT_COUNT      = 1<<5;
+    private static final int KIND_CLASS_INIT_TIME       = 1<<6;
     private static final int KIND_EXT_ALLOCATED_OBJECTS = 1<<12;
     private static final int KIND_EXT_ALLOCATED_BYTES   = 1<<13;
     private static final int KIND_EXT_FREED_OBJECTS     = 1<<14;
@@ -64,6 +68,10 @@ public final class VMDebug {
         KIND_FREED_BYTES;
     public static final int KIND_GLOBAL_GC_INVOCATIONS =
         KIND_GC_INVOCATIONS;
+    public static final int KIND_GLOBAL_CLASS_INIT_COUNT =
+        KIND_CLASS_INIT_COUNT;
+    public static final int KIND_GLOBAL_CLASS_INIT_TIME =
+        KIND_CLASS_INIT_TIME;
     public static final int KIND_GLOBAL_EXT_ALLOCATED_OBJECTS =
         KIND_EXT_ALLOCATED_OBJECTS;
     public static final int KIND_GLOBAL_EXT_ALLOCATED_BYTES =
@@ -83,6 +91,10 @@ public final class VMDebug {
         KIND_FREED_BYTES << 16;
     public static final int KIND_THREAD_GC_INVOCATIONS =
         KIND_GC_INVOCATIONS << 16;
+    public static final int KIND_THREAD_CLASS_INIT_COUNT =
+        KIND_CLASS_INIT_COUNT << 16;
+    public static final int KIND_THREAD_CLASS_INIT_TIME =
+        KIND_CLASS_INIT_TIME << 16;
     public static final int KIND_THREAD_EXT_ALLOCATED_OBJECTS =
         KIND_EXT_ALLOCATED_OBJECTS << 16;
     public static final int KIND_THREAD_EXT_ALLOCATED_BYTES =
@@ -120,14 +132,19 @@ public final class VMDebug {
     public static native boolean isDebuggerConnected();
 
     /**
-     * Enable object allocation count logging and reporting.  Call with
-     * a depth of zero to disable.  This produces "top N" lists on every GC.
+     * Returns an array of strings that identify VM features.  This is
+     * used by DDMS to determine what sorts of operations the VM can
+     * perform.
+     *
+     * @hide
      */
-    //public static native void enableTopAllocCounts(int depth);
-    
+    public static native String[] getVmFeatureList();
+
     /**
      * Start method tracing with default name, size, and with <code>0</code>
      * flags.
+     *
+     * @deprecated not used, not needed
      */
     public static void startMethodTracing() {
         startMethodTracing(DEFAULT_METHOD_TRACE_FILE_NAME, 0, 0);
@@ -153,7 +170,12 @@ public final class VMDebug {
      */
     public static void startMethodTracing(String traceFileName,
         int bufferSize, int flags) {
-        startMethodTracing(traceFileName, null, bufferSize, flags);
+
+        if (traceFileName == null) {
+            throw new NullPointerException();
+        }
+
+        startMethodTracingNative(traceFileName, null, bufferSize, flags);
     }
 
     /**
@@ -165,7 +187,33 @@ public final class VMDebug {
      * this and find it would be useful.
      * @hide
      */
-    public static native void startMethodTracing(String traceFileName,
+    public static void startMethodTracing(String traceFileName,
+        FileDescriptor fd, int bufferSize, int flags)
+    {
+        if (traceFileName == null || fd == null) {
+            throw new NullPointerException();
+        }
+
+        startMethodTracingNative(traceFileName, fd, bufferSize, flags);
+    }
+
+    /**
+     * Starts method tracing without a backing file.  When stopMethodTracing
+     * is called, the result is sent directly to DDMS.  (If DDMS is not
+     * attached when tracing ends, the profiling data will be discarded.)
+     *
+     * @hide
+     */
+    public static void startMethodTracingDdms(int bufferSize, int flags) {
+        startMethodTracingNative(null, null, bufferSize, flags);
+    }
+
+    /**
+     * Implements all startMethodTracing variants.
+     *
+     * @hide
+     */
+    private static native void startMethodTracingNative(String traceFileName,
         FileDescriptor fd, int bufferSize, int flags);
 
     /**
@@ -277,6 +325,16 @@ public final class VMDebug {
     public static native void dumpHprofData(String fileName) throws IOException;
 
     /**
+     * Collect "hprof" and send it to DDMS.  This will cause a GC.
+     *
+     * @throws UnsupportedOperationException if the VM was built without
+     *         HPROF support.
+     *
+     * @hide
+     */
+    public static native void dumpHprofDataDdms();
+
+    /**
      * Primes the register map cache.
      *
      * @hide
@@ -284,14 +342,30 @@ public final class VMDebug {
     public static native boolean cacheRegisterMap(String classAndMethodDesc);
 
     /**
-     * Crashes the VM.  Seriously.  Dumps the stack trace for the current
-     * thread and then aborts the VM so you can see the native stack trace.
-     * Useful for figuring out how you got somewhere when lots of native
-     * code is involved.
+     * Dumps the contents of the VM reference tables (e.g. JNI locals and
+     * globals) to the log file.
+     *
+     * @hide
+     */
+    public static native void dumpReferenceTables();
+
+    /**
+     * Crashes the VM.  Seriously.  Dumps the interpreter stack trace for
+     * the current thread and then aborts the VM so you can see the native
+     * stack trace.  Useful for figuring out how you got somewhere when
+     * lots of native code is involved.
      *
      * @hide
      */
     public static native void crash();
+
+    /**
+     * Together with gdb, provide a handy way to stop the VM at user-tagged
+     * locations.
+     *
+     * @hide
+     */
+    public static native void infopoint(int id);
 
     /*
      * Fake method, inserted into dmtrace output when the garbage collector

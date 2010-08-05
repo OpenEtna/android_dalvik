@@ -32,13 +32,10 @@ extern void dlmalloc_walk_free_pages(void(*)(void*, void*, void*), void*);
 static void snapIdealFootprint(void);
 static void setIdealFootprint(size_t max);
 
-#ifndef PAGE_SIZE
-#define PAGE_SIZE 4096
-#endif
 #define ALIGN_UP_TO_PAGE_SIZE(p) \
-    (((size_t)(p) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
+    (((size_t)(p) + (SYSTEM_PAGE_SIZE - 1)) & ~(SYSTEM_PAGE_SIZE - 1))
 #define ALIGN_DOWN_TO_PAGE_SIZE(p) \
-    ((size_t)(p) & ~(PAGE_SIZE - 1))
+    ((size_t)(p) & ~(SYSTEM_PAGE_SIZE - 1))
 
 #define HEAP_UTILIZATION_MAX        1024
 #define DEFAULT_HEAP_UTILIZATION    512     // Range 1..HEAP_UTILIZATION_MAX
@@ -100,7 +97,7 @@ live ratio of small heap after a gc; scale it based on that.
 typedef struct {
     /* The mspace to allocate from.
      */
-    mspace *msp;
+    mspace msp;
 
     /* The bitmap that keeps track of where objects are in the heap.
      */
@@ -277,10 +274,10 @@ countFree(Heap *heap, const void *ptr, bool isObj)
 
 static HeapSource *gHs = NULL;
 
-static mspace *
+static mspace
 createMspace(size_t startSize, size_t absoluteMaxSize, size_t id)
 {
-    mspace *msp;
+    mspace msp;
     char name[PATH_MAX];
 
     /* If two ashmem regions have the same name, only one gets
@@ -319,7 +316,7 @@ createMspace(size_t startSize, size_t absoluteMaxSize, size_t id)
 }
 
 static bool
-addNewHeap(HeapSource *hs, mspace *msp, size_t mspAbsoluteMaxSize)
+addNewHeap(HeapSource *hs, mspace msp, size_t mspAbsoluteMaxSize)
 {
     Heap heap;
 
@@ -364,7 +361,7 @@ addNewHeap(HeapSource *hs, mspace *msp, size_t mspAbsoluteMaxSize)
     /* Don't let the soon-to-be-old heap grow any further.
      */
     if (hs->numHeaps > 0) {
-        mspace *msp = hs->heaps[0].msp;
+        mspace msp = hs->heaps[0].msp;
         mspace_set_max_allowed_footprint(msp, mspace_footprint(msp));
     }
 
@@ -498,7 +495,7 @@ dvmHeapSourceStartupBeforeFork()
         /* Create a new heap for post-fork zygote allocations.  We only
          * try once, even if it fails.
          */
-        LOGI("Splitting out new zygote heap\n");
+        LOGV("Splitting out new zygote heap\n");
         gDvm.newZygoteHeapAllocated = true;
         return addNewHeap(hs, NULL, 0);
     }
@@ -594,16 +591,17 @@ dvmHeapSourceGetValue(enum HeapSourceValueSpec spec, size_t perHeapStats[],
 
 /*
  * Writes shallow copies of the currently-used bitmaps into outBitmaps,
- * returning the number of bitmaps written.  Returns <0 if the array
- * was not long enough.
+ * returning the number of bitmaps written.  Returns 0 if the array was
+ * not long enough or if there are no heaps, either of which is an error.
  */
-ssize_t
+size_t
 dvmHeapSourceGetObjectBitmaps(HeapBitmap outBitmaps[], size_t maxBitmaps)
 {
     HeapSource *hs = gHs;
 
     HS_BOILERPLATE();
 
+    assert(hs->numHeaps != 0);
     if (maxBitmaps >= hs->numHeaps) {
         size_t i;
 
@@ -612,7 +610,7 @@ dvmHeapSourceGetObjectBitmaps(HeapBitmap outBitmaps[], size_t maxBitmaps)
         }
         return i;
     }
-    return -1;
+    return 0;
 }
 
 /*
@@ -996,7 +994,7 @@ setSoftLimit(HeapSource *hs, size_t softLimit)
      * max_allowed, because the heap may not have grown all the
      * way to the allowed size yet.
      */
-    mspace *msp = hs->heaps[0].msp;
+    mspace msp = hs->heaps[0].msp;
     size_t currentHeapSize = mspace_footprint(msp);
     if (softLimit < currentHeapSize) {
         /* Don't let the heap grow any more, and impose a soft limit.
@@ -1023,7 +1021,7 @@ setIdealFootprint(size_t max)
     HeapSource *hs = gHs;
 #if DEBUG_HEAP_SOURCE
     HeapSource oldHs = *hs;
-    mspace *msp = hs->heaps[0].msp;
+    mspace msp = hs->heaps[0].msp;
     size_t oldAllowedFootprint =
             mspace_max_allowed_footprint(msp);
 #endif
@@ -1286,7 +1284,7 @@ static void releasePagesInRange(void *start, void *end, void *nbytes)
     * We also align the end address.
     */
     start = (void *)ALIGN_UP_TO_PAGE_SIZE(start);
-    end = (void *)((size_t)end & ~(PAGE_SIZE - 1));
+    end = (void *)((size_t)end & ~(SYSTEM_PAGE_SIZE - 1));
     if (start < end) {
         size_t length = (char *)end - (char *)start;
         madvise(start, length, MADV_DONTNEED);
@@ -1479,7 +1477,7 @@ gcForExternalAlloc(bool collectSoftReferences)
         }
     }
 #endif
-    dvmCollectGarbageInternal(collectSoftReferences);
+    dvmCollectGarbageInternal(collectSoftReferences, GC_EXTERNAL_ALLOC);
 }
 
 /*

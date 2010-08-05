@@ -14,26 +14,56 @@
  * limitations under the License.
  */
 
-#include "codegen/Optimizer.h"
-
 #ifndef _DALVIK_VM_COMPILER_IR
 #define _DALVIK_VM_COMPILER_IR
 
+#include "codegen/Optimizer.h"
+
+typedef enum RegisterClass {
+    kCoreReg,
+    kFPReg,
+    kAnyReg,
+} RegisterClass;
+
+typedef enum RegLocationType {
+    kLocDalvikFrame = 0,
+    kLocPhysReg,
+    kLocRetval,          // Return region in interpState
+    kLocSpill,
+} RegLocationType;
+
+typedef struct RegLocation {
+    RegLocationType location:2;
+    unsigned wide:1;
+    unsigned fp:1;      // Hint for float/double
+    u1 lowReg:6;        // First physical register
+    u1 highReg:6;       // 2nd physical register (if wide)
+    s2 sRegLow;         // SSA name for low Dalvik word
+} RegLocation;
+
+#define INVALID_SREG (-1)
+#define INVALID_REG (-1)
+
 typedef enum BBType {
     /* For coding convenience reasons chaining cell types should appear first */
-    CHAINING_CELL_NORMAL = 0,
-    CHAINING_CELL_HOT,
-    CHAINING_CELL_INVOKE_SINGLETON,
-    CHAINING_CELL_INVOKE_PREDICTED,
-    CHAINING_CELL_LAST,
-    DALVIK_BYTECODE,
-    PC_RECONSTRUCTION,
-    EXCEPTION_HANDLING,
+    kChainingCellNormal = 0,
+    kChainingCellHot,
+    kChainingCellInvokeSingleton,
+    kChainingCellInvokePredicted,
+    kChainingCellBackwardBranch,
+    kChainingCellGap,
+    /* Don't insert new fields between Gap and Last */
+    kChainingCellLast = kChainingCellGap + 1,
+    kEntryBlock,
+    kDalvikByteCode,
+    kExitBlock,
+    kPCReconstruction,
+    kExceptionHandling,
 } BBType;
 
 typedef struct ChainCellCounts {
     union {
-        u1 count[CHAINING_CELL_LAST];
+        u1 count[kChainingCellLast]; /* include one more space for the gap # */
         u4 dummyForAlignment;
     } u;
 } ChainCellCounts;
@@ -45,13 +75,42 @@ typedef struct LIR {
     struct LIR *target;
 } LIR;
 
+enum ExtendedMIROpcode {
+    kMirOpFirst = 256,
+    kMirOpPhi = kMirOpFirst,
+    kMirOpNullNRangeUpCheck,
+    kMirOpNullNRangeDownCheck,
+    kMirOpLowerBound,
+    kMirOpPunt,
+    kMirOpLast,
+};
+
+struct SSARepresentation;
+
+typedef enum {
+    kMIRIgnoreNullCheck = 0,
+    kMIRNullCheckOnly,
+    kMIRIgnoreRangeCheck,
+    kMIRRangeCheckOnly,
+} MIROptimizationFlagPositons;
+
+#define MIR_IGNORE_NULL_CHECK           (1 << kMIRIgnoreNullCheck)
+#define MIR_NULL_CHECK_ONLY             (1 << kMIRNullCheckOnly)
+#define MIR_IGNORE_RANGE_CHECK          (1 << kMIRIgnoreRangeCheck)
+#define MIR_RANGE_CHECK_ONLY            (1 << kMIRRangeCheckOnly)
+
 typedef struct MIR {
     DecodedInstruction dalvikInsn;
     unsigned int width;
     unsigned int offset;
     struct MIR *prev;
     struct MIR *next;
+    struct SSARepresentation *ssaRep;
+    int OptimizationFlags;
+    int seqNum;
 } MIR;
+
+struct BasicBlockDataFlow;
 
 typedef struct BasicBlock {
     int id;
@@ -65,7 +124,11 @@ typedef struct BasicBlock {
     struct BasicBlock *fallThrough;
     struct BasicBlock *taken;
     struct BasicBlock *next;            // Serial link for book keeping purposes
+    struct BasicBlockDataFlow *dataFlowInfo;
 } BasicBlock;
+
+struct LoopAnalysis;
+struct RegisterPool;
 
 typedef struct CompilationUnit {
     int numInsts;
@@ -87,20 +150,59 @@ typedef struct CompilationUnit {
     bool allSingleStep;
     bool halveInstCount;
     bool executionCount;                // Add code to count trace executions
-    int numChainingCells[CHAINING_CELL_LAST];
-    LIR *firstChainingLIR[CHAINING_CELL_LAST];
-    RegisterScoreboard registerScoreboard;      // Track register dependency
+    bool hasLoop;
+    bool heapMemOp;                     // Mark mem ops for self verification
+    int numChainingCells[kChainingCellGap];
+    LIR *firstChainingLIR[kChainingCellGap];
+    LIR *chainingCellBottom;
+    struct RegisterPool *regPool;
     int optRound;                       // round number to tell an LIR's age
+    jmp_buf *bailPtr;
     JitInstructionSetType instructionSet;
+    /* Number of total regs used in the whole cUnit after SSA transformation */
+    int numSSARegs;
+    /* Map SSA reg i to the Dalvik[15..0]/Sub[31..16] pair. */
+    GrowableList *ssaToDalvikMap;
+
+    /* The following are new data structures to support SSA representations */
+    /* Map original Dalvik reg i to the SSA[15..0]/Sub[31..16] pair */
+    int *dalvikToSSAMap;                // length == method->registersSize
+    BitVector *isConstantV;             // length == numSSAReg
+    int *constantValues;                // length == numSSAReg
+
+    /* Data structure for loop analysis and optimizations */
+    struct LoopAnalysis *loopAnalysis;
+
+    /* Map SSA names to location */
+    RegLocation *regLocation;
+    int sequenceNumber;
+
+    /*
+     * Set to the Dalvik PC of the switch instruction if it has more than
+     * MAX_CHAINED_SWITCH_CASES cases.
+     */
+    const u2 *switchOverflowPad;
 } CompilationUnit;
+
+#if defined(WITH_SELF_VERIFICATION)
+#define HEAP_ACCESS_SHADOW(_state) cUnit->heapMemOp = _state
+#else
+#define HEAP_ACCESS_SHADOW(_state)
+#endif
 
 BasicBlock *dvmCompilerNewBB(BBType blockType);
 
 void dvmCompilerAppendMIR(BasicBlock *bb, MIR *mir);
 
+void dvmCompilerPrependMIR(BasicBlock *bb, MIR *mir);
+
 void dvmCompilerAppendLIR(CompilationUnit *cUnit, LIR *lir);
 
 void dvmCompilerInsertLIRBefore(LIR *currentLIR, LIR *newLIR);
+
+void dvmCompilerInsertLIRAfter(LIR *currentLIR, LIR *newLIR);
+
+void dvmCompilerAbort(CompilationUnit *cUnit);
 
 /* Debug Utilities */
 void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit);

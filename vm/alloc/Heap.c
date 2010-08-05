@@ -37,6 +37,13 @@
 #define kNonCollectableRefDefault   16
 #define kFinalizableRefDefault      128
 
+static const char* GcReasonStr[] = {
+    [GC_FOR_MALLOC] = "GC_FOR_MALLOC",
+    [GC_EXPLICIT] = "GC_EXPLICIT",
+    [GC_EXTERNAL_ALLOC] = "GC_EXTERNAL_ALLOC",
+    [GC_HPROF_DUMP_HEAP] = "GC_HPROF_DUMP_HEAP"
+};
+
 /*
  * Initialize the GC heap.
  *
@@ -236,9 +243,9 @@ Object *dvmGetNextHeapWorkerObject(HeapWorkerOperation *op)
     if (obj != NULL) {
         uintptr_t workBits;
 
-        workBits = (uintptr_t)obj & (WORKER_CLEAR | WORKER_ENQUEUE);
+        workBits = (uintptr_t)obj & WORKER_ENQUEUE;
         assert(workBits != 0);
-        obj = (Object *)((uintptr_t)obj & ~(WORKER_CLEAR | WORKER_ENQUEUE));
+        obj = (Object *)((uintptr_t)obj & ~WORKER_ENQUEUE);
 
         *op = workBits;
     } else {
@@ -326,7 +333,7 @@ static void gcForMalloc(bool collectSoftReferences)
      */
     LOGD_HEAP("dvmMalloc initiating GC%s\n",
             collectSoftReferences ? "(collect SoftReferences)" : "");
-    dvmCollectGarbageInternal(collectSoftReferences);
+    dvmCollectGarbageInternal(collectSoftReferences, GC_FOR_MALLOC);
 }
 
 /* Try as hard as possible to allocate some memory.
@@ -573,10 +580,6 @@ alloc_succeeded:
             }
         }
 
-#if WITH_OBJECT_HEADERS
-        hc->header = OBJECT_HEADER;
-        hc->birthGeneration = gGeneration;
-#endif
         ptr = hc->data;
 
         /* The caller may not want us to collect this object.
@@ -641,7 +644,7 @@ alloc_succeeded:
             dvmAddTrackedAlloc(ptr, NULL);
         }
     } else {
-        /* 
+        /*
          * The allocation failed; throw an OutOfMemoryError.
          */
         throwOOME();
@@ -724,7 +727,7 @@ size_t dvmObjectSizeInHeap(const Object *obj)
  * way to enforce this is to refuse to GC on an allocation made by the
  * JDWP thread -- we have to expand the heap or fail.
  */
-void dvmCollectGarbageInternal(bool collectSoftReferences)
+void dvmCollectGarbageInternal(bool collectSoftReferences, enum GcReason reason)
 {
     GcHeap *gcHeap = gDvm.gcHeap;
     Object *softReferences;
@@ -766,7 +769,7 @@ void dvmCollectGarbageInternal(bool collectSoftReferences)
     }
     gcHeap->gcStartTime = now;
 
-    LOGV_HEAP("GC starting -- suspending threads\n");
+    LOGV_HEAP("%s starting -- suspending threads\n", GcReasonStr[reason]);
 
     dvmSuspendAllThreads(SUSPEND_FOR_GC);
 
@@ -853,7 +856,8 @@ void dvmCollectGarbageInternal(bool collectSoftReferences)
                 (int) time(NULL), (int) getpid());
             gcHeap->hprofFileName = nameBuf;
         }
-        gcHeap->hprofContext = hprofStartup(gcHeap->hprofFileName);
+        gcHeap->hprofContext = hprofStartup(gcHeap->hprofFileName,
+                gcHeap->hprofDirectToDdms);
         if (gcHeap->hprofContext != NULL) {
             hprofStartHeapDump(gcHeap->hprofContext);
         }
@@ -1028,6 +1032,20 @@ void dvmCollectGarbageInternal(bool collectSoftReferences)
     dvmUnlockMutex(&gDvm.heapWorkerListLock);
     dvmUnlockMutex(&gDvm.heapWorkerLock);
 
+#if defined(WITH_JIT)
+    extern void dvmCompilerPerformSafePointChecks(void);
+
+    /*
+     * Patching a chaining cell is very cheap as it only updates 4 words. It's
+     * the overhead of stopping all threads and synchronizing the I/D cache
+     * that makes it expensive.
+     *
+     * Therefore we batch those work orders in a queue and go through them
+     * when threads are suspended for GC.
+     */
+    dvmCompilerPerformSafePointChecks();
+#endif
+
     dvmResumeAllThreads(SUSPEND_FOR_GC);
     if (oldThreadPriority != kInvalidPriority) {
         if (setpriority(PRIO_PROCESS, 0, oldThreadPriority) != 0) {
@@ -1042,13 +1060,8 @@ void dvmCollectGarbageInternal(bool collectSoftReferences)
         }
     }
     gcElapsedTime = (dvmGetRelativeTimeUsec() - gcHeap->gcStartTime) / 1000;
-    if (gcElapsedTime < 10000) {
-        LOGD("GC freed %d objects / %zd bytes in %dms\n",
-                numFreed, sizeFreed, (int)gcElapsedTime);
-    } else {
-        LOGD("GC freed %d objects / %zd bytes in %d sec\n",
-                numFreed, sizeFreed, (int)(gcElapsedTime / 1000));
-    }
+    LOGD("%s freed %d objects / %zd bytes in %dms\n",
+         GcReasonStr[reason], numFreed, sizeFreed, (int)gcElapsedTime);
     dvmLogGcStats(numFreed, sizeFreed, gcElapsedTime);
 
     if (gcHeap->ddmHpifWhen != 0) {
@@ -1073,7 +1086,7 @@ void dvmCollectGarbageInternal(bool collectSoftReferences)
  *
  * Returns 0 on success, or an error code on failure.
  */
-int hprofDumpHeap(const char* fileName)
+int hprofDumpHeap(const char* fileName, bool directToDdms)
 {
     int result;
 
@@ -1081,7 +1094,8 @@ int hprofDumpHeap(const char* fileName)
 
     gDvm.gcHeap->hprofDumpOnGc = true;
     gDvm.gcHeap->hprofFileName = fileName;
-    dvmCollectGarbageInternal(false);
+    gDvm.gcHeap->hprofDirectToDdms = directToDdms;
+    dvmCollectGarbageInternal(false, GC_HPROF_DUMP_HEAP);
     result = gDvm.gcHeap->hprofResult;
 
     dvmUnlockMutex(&gDvm.gcHeapLock);

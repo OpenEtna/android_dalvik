@@ -25,7 +25,7 @@ import armv5te/header.S
 #import cstubs/stubdefs.c
 
 # highly-platform-specific defs
-import armv5te/platform.S
+import armv5te-vfp/platform.S
 
 # common defs for the C helpers; include this before the instruction handlers
 #import c/opcommon.c
@@ -42,6 +42,12 @@ op-start armv5te-vfp
     op TEMPLATE_SHL_LONG armv5te
     op TEMPLATE_SHR_LONG armv5te
     op TEMPLATE_USHR_LONG armv5te
+    op TEMPLATE_THROW_EXCEPTION_COMMON armv5te
+    op TEMPLATE_STRING_COMPARETO armv5te
+    op TEMPLATE_STRING_INDEXOF armv5te
+    op TEMPLATE_INTERPRET armv5te
+    op TEMPLATE_MONITOR_ENTER armv5te
+    op TEMPLATE_MONITOR_ENTER_DEBUG armv5te
 
 op-end
 

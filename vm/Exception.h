@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 /*
  * Exception handling.
  */
@@ -32,6 +33,25 @@ INLINE void dvmThrowException(const char* exceptionDescriptor,
     const char* msg)
 {
     dvmThrowChainedException(exceptionDescriptor, msg, NULL);
+}
+
+/*
+ * Like dvmThrowChainedException, but takes printf-style args for the message.
+ */
+void dvmThrowExceptionFmtV(const char* exceptionDescriptor, const char* fmt,
+    va_list args);
+void dvmThrowExceptionFmt(const char* exceptionDescriptor, const char* fmt, ...)
+#if defined(__GNUC__)
+    __attribute__ ((format(printf, 2, 3)))
+#endif
+    ;
+INLINE void dvmThrowExceptionFmt(const char* exceptionDescriptor,
+    const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    dvmThrowExceptionFmtV(exceptionDescriptor, fmt, args);
+    va_end(args);
 }
 
 /*

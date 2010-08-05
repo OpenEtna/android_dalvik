@@ -83,6 +83,8 @@ bool dvmMterpStd(Thread* self, InterpState* glue)
     glue->pSelfSuspendCount = &self->suspendCount;
 #if defined(WITH_JIT)
     glue->pJitProfTable = gDvmJit.pProfTable;
+    glue->ppJitProfTable = &gDvmJit.pProfTable;
+    glue->jitThreshold = gDvmJit.threshold;
 #endif
 #if defined(WITH_DEBUGGER)
     glue->pDebuggerActive = &gDvm.debuggerActive;
@@ -105,6 +107,13 @@ bool dvmMterpStd(Thread* self, InterpState* glue)
     //LOGI("first instruction is 0x%04x\n", glue->pc[0]);
 
     changeInterp = dvmMterpStdRun(glue);
+
+#if defined(WITH_JIT)
+    if (glue->jitState != kJitSingleStep) {
+        glue->self->inJitCodeCache = NULL;
+    }
+#endif
+
     if (!changeInterp) {
         /* this is a "normal" exit; we're not coming back */
 #ifdef LOG_INSTR

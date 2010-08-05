@@ -302,6 +302,11 @@ static inline void putDoubleToArray(u4* ptr, int idx, double dval)
 #define INST_INST(_inst)    ((_inst) & 0xff)
 
 /*
+ * Replace the opcode (used when handling breakpoints).  _opcode is a u1.
+ */
+#define INST_REPLACE_OP(_inst, _opcode) (((_inst) & 0xff00) | _opcode)
+
+/*
  * Extract the "vA, vB" 4-bit registers from the instruction word (_inst is u2).
  */
 #define INST_A(_inst)       (((_inst) >> 8) & 0x0f)
@@ -338,8 +343,7 @@ static inline void putDoubleToArray(u4* ptr, int idx, double dval)
 #if defined(WITH_JIT)
 # define NEED_INTERP_SWITCH(_current) (                                     \
     (_current == INTERP_STD) ?                                              \
-        dvmJitDebuggerOrProfilerActive(interpState->jitState) :             \
-        !dvmJitDebuggerOrProfilerActive(interpState->jitState) )
+        dvmJitDebuggerOrProfilerActive() : !dvmJitDebuggerOrProfilerActive() )
 #else
 # define NEED_INTERP_SWITCH(_current) (                                     \
     (_current == INTERP_STD) ?                                              \
@@ -419,7 +423,8 @@ static inline bool checkForNullExportPC(Object* obj, u4* fp, const u2* pc)
 
 #define CHECK_DEBUG_AND_PROF() ((void)0)
 
-#define CHECK_JIT() ((void)0)
+#define CHECK_JIT() (0)
+#define ABORT_JIT_TSELECT() ((void)0)
 
 /* File: portable/stubdefs.c */
 /*
@@ -443,6 +448,8 @@ static inline bool checkForNullExportPC(Object* obj, u4* fp, const u2* pc)
  *
  * Assumes the existence of "const u2* pc" and (for threaded operation)
  * "u2 inst".
+ *
+ * TODO: remove "switch" version.
  */
 #ifdef THREADED_INTERP
 # define H(_op)             &&op_##_op
@@ -452,12 +459,16 @@ static inline bool checkForNullExportPC(Object* obj, u4* fp, const u2* pc)
         inst = FETCH(0);                                                    \
         CHECK_DEBUG_AND_PROF();                                             \
         CHECK_TRACKED_REFS();                                               \
-        CHECK_JIT();                                                        \
+        if (CHECK_JIT()) GOTO_bail_switch();                                \
         goto *handlerTable[INST_INST(inst)];                                \
+    }
+# define FINISH_BKPT(_opcode) {                                             \
+        goto *handlerTable[_opcode];                                        \
     }
 #else
 # define HANDLE_OPCODE(_op) case _op:
 # define FINISH(_offset)    { ADJUST_PC(_offset); break; }
+# define FINISH_BKPT(opcode) { > not implemented < }
 #endif
 
 #define OP_END
@@ -512,7 +523,6 @@ static inline bool checkForNullExportPC(Object* obj, u4* fp, const u2* pc)
             GOTO_bail_switch();                                             \
         }                                                                   \
     }
-
 
 /* File: c/opcommon.c */
 /* forward declarations of goto targets */
@@ -1207,18 +1217,26 @@ bool INTERP_FUNC_NAME(Thread* self, InterpState* interpState)
          interpState->pc,
          interpState->method->name);
 #endif
-
 #if INTERP_TYPE == INTERP_DBG
-    /* Check to see if we've got a trace selection request.  If we do,
-     * but something is amiss, revert to the fast interpreter.
-     */
-    if (dvmJitCheckTraceRequest(self,interpState)) {
+    /* Check to see if we've got a trace selection request. */
+    if (
+         /*
+          * Only perform dvmJitCheckTraceRequest if the entry point is
+          * EntryInstr and the jit state is either kJitTSelectRequest or
+          * kJitTSelectRequestHot. If debugger/profiler happens to be attached,
+          * dvmJitCheckTraceRequest will change the jitState to kJitDone but
+          * but stay in the dbg interpreter.
+          */
+         (interpState->entryPoint == kInterpEntryInstr) &&
+         (interpState->jitState == kJitTSelectRequest ||
+          interpState->jitState == kJitTSelectRequestHot) &&
+         dvmJitCheckTraceRequest(self, interpState)) {
         interpState->nextMode = INTERP_STD;
-        //LOGD("** something wrong, exiting\n");
+        //LOGD("Invalid trace request, exiting\n");
         return true;
     }
-#endif
-#endif
+#endif /* INTERP_TYPE == INTERP_DBG */
+#endif /* WITH_JIT */
 
     /* copy state in */
     curMethod = interpState->method;
@@ -1251,6 +1269,7 @@ bool INTERP_FUNC_NAME(Thread* self, InterpState* interpState)
         /* just fall through to instruction loop or threaded kickstart */
         break;
     case kInterpEntryReturn:
+        CHECK_JIT();
         goto returnFromMethod;
     case kInterpEntryThrow:
         goto exceptionThrown;
@@ -2871,8 +2890,35 @@ OP_END
 HANDLE_OPCODE(OP_UNUSED_EB)
 OP_END
 
-/* File: c/OP_UNUSED_EC.c */
-HANDLE_OPCODE(OP_UNUSED_EC)
+/* File: c/OP_BREAKPOINT.c */
+HANDLE_OPCODE(OP_BREAKPOINT)
+#if (INTERP_TYPE == INTERP_DBG) && defined(WITH_DEBUGGER)
+    {
+        /*
+         * Restart this instruction with the original opcode.  We do
+         * this by simply jumping to the handler.
+         *
+         * It's probably not necessary to update "inst", but we do it
+         * for the sake of anything that needs to do disambiguation in a
+         * common handler with INST_INST.
+         *
+         * The breakpoint itself is handled over in updateDebugger(),
+         * because we need to detect other events (method entry, single
+         * step) and report them in the same event packet, and we're not
+         * yet handling those through breakpoint instructions.  By the
+         * time we get here, the breakpoint has already been handled and
+         * the thread resumed.
+         */
+        u1 originalOpCode = dvmGetOriginalOpCode(pc);
+        LOGV("+++ break 0x%02x (0x%04x -> 0x%04x)\n", originalOpCode, inst,
+            INST_REPLACE_OP(inst, originalOpCode));
+        inst = INST_REPLACE_OP(inst, originalOpCode);
+        FINISH_BKPT(originalOpCode);
+    }
+#else
+    LOGE("Breakpoint hit in non-debug interpreter\n");
+    dvmAbort();
+#endif
 OP_END
 
 /* File: c/OP_THROW_VERIFICATION_ERROR.c */
@@ -2896,14 +2942,15 @@ HANDLE_OPCODE(OP_EXECUTE_INLINE /*vB, {vD, vE, vF, vG}, inline@CCCC*/)
          * the rest uninitialized.  We're assuming that, if the method
          * needs them, they'll be specified in the call.
          *
-         * This annoys gcc when optimizations are enabled, causing a
-         * "may be used uninitialized" warning.  We can quiet the warnings
-         * for a slight penalty (5%: 373ns vs. 393ns on empty method).  Note
-         * that valgrind is perfectly happy with this arrangement, because
-         * the uninitialiezd values are never actually used.
+         * However, this annoys gcc when optimizations are enabled,
+         * causing a "may be used uninitialized" warning.  Quieting
+         * the warnings incurs a slight penalty (5%: 373ns vs. 393ns
+         * on empty method).  Note that valgrind is perfectly happy
+         * either way as the uninitialiezd values are never actually
+         * used.
          */
         u4 arg0, arg1, arg2, arg3;
-        //arg0 = arg1 = arg2 = arg3 = 0;
+        arg0 = arg1 = arg2 = arg3 = 0;
 
         EXPORT_PC();
 
@@ -2944,8 +2991,49 @@ HANDLE_OPCODE(OP_EXECUTE_INLINE /*vB, {vD, vE, vF, vG}, inline@CCCC*/)
     FINISH(3);
 OP_END
 
-/* File: c/OP_UNUSED_EF.c */
-HANDLE_OPCODE(OP_UNUSED_EF)
+/* File: c/OP_EXECUTE_INLINE_RANGE.c */
+HANDLE_OPCODE(OP_EXECUTE_INLINE_RANGE /*{vCCCC..v(CCCC+AA-1)}, inline@BBBB*/)
+    {
+        u4 arg0, arg1, arg2, arg3;
+        arg0 = arg1 = arg2 = arg3 = 0;      /* placate gcc */
+
+        EXPORT_PC();
+
+        vsrc1 = INST_AA(inst);      /* #of args */
+        ref = FETCH(1);             /* inline call "ref" */
+        vdst = FETCH(2);            /* range base */
+        ILOGV("|execute-inline-range args=%d @%d {regs=v%d-v%d}",
+            vsrc1, ref, vdst, vdst+vsrc1-1);
+
+        assert((vdst >> 16) == 0);  // 16-bit type -or- high 16 bits clear
+        assert(vsrc1 <= 4);
+
+        switch (vsrc1) {
+        case 4:
+            arg3 = GET_REGISTER(vdst+3);
+            /* fall through */
+        case 3:
+            arg2 = GET_REGISTER(vdst+2);
+            /* fall through */
+        case 2:
+            arg1 = GET_REGISTER(vdst+1);
+            /* fall through */
+        case 1:
+            arg0 = GET_REGISTER(vdst+0);
+            /* fall through */
+        default:        // case 0
+            ;
+        }
+
+#if INTERP_TYPE == INTERP_DBG
+        if (!dvmPerformInlineOp4Dbg(arg0, arg1, arg2, arg3, &retval, ref))
+            GOTO_exceptionThrown();
+#else
+        if (!dvmPerformInlineOp4Std(arg0, arg1, arg2, arg3, &retval, ref))
+            GOTO_exceptionThrown();
+#endif
+    }
+    FINISH(3);
 OP_END
 
 /* File: c/OP_INVOKE_DIRECT_EMPTY.c */
@@ -3570,6 +3658,10 @@ GOTO_TARGET(returnFromMethod)
         if (dvmIsBreakFrame(fp)) {
             /* bail without popping the method frame from stack */
             LOGVV("+++ returned into break frame\n");
+#if defined(WITH_JIT)
+            /* Let the Jit know the return is terminating normally */
+            CHECK_JIT();
+#endif
             GOTO_bail();
         }
 
@@ -3614,6 +3706,10 @@ GOTO_TARGET(exceptionThrown)
          */
         PERIODIC_CHECKS(kInterpEntryThrow, 0);
 
+#if defined(WITH_JIT)
+        // Something threw during trace selection - abort the current trace
+        ABORT_JIT_TSELECT();
+#endif
         /*
          * We save off the exception and clear the exception status.  While
          * processing the exception we might need to load some Throwable
@@ -3664,6 +3760,9 @@ GOTO_TARGET(exceptionThrown)
          *
          * If we do find a catch block, we want to transfer execution to
          * that point.
+         *
+         * Note this can cause an exception while resolving classes in
+         * the "catch" blocks.
          */
         catchRelPc = dvmFindCatchBlock(self, pc - curMethod->insns,
                     exception, false, (void*)&fp);
@@ -3678,9 +3777,19 @@ GOTO_TARGET(exceptionThrown)
          * Note we want to do this *after* the call to dvmFindCatchBlock,
          * because that may need extra stack space to resolve exception
          * classes (e.g. through a class loader).
+         *
+         * It's possible for the stack overflow handling to cause an
+         * exception (specifically, class resolution in a "catch" block
+         * during the call above), so we could see the thread's overflow
+         * flag raised but actually be running in a "nested" interpreter
+         * frame.  We don't allow doubled-up StackOverflowErrors, so
+         * we can check for this by just looking at the exception type
+         * in the cleanup function.  Also, we won't unroll past the SOE
+         * point because the more-recent exception will hit a break frame
+         * as it unrolls to here.
          */
         if (self->stackOverflowed)
-            dvmCleanupStackOverflow(self);
+            dvmCleanupStackOverflow(self, exception);
 
         if (catchRelPc < 0) {
             /* falling through to JNI code or off the bottom of the stack */
@@ -3845,10 +3954,11 @@ GOTO_TARGET(invokeMethod, bool methodCallRange, const Method* _methodToCall,
             bottom = (u1*) newSaveArea - methodToCall->outsSize * sizeof(u4);
             if (bottom < self->interpStackEnd) {
                 /* stack overflow */
-                LOGV("Stack overflow on method call (start=%p end=%p newBot=%p size=%d '%s')\n",
+                LOGV("Stack overflow on method call (start=%p end=%p newBot=%p(%d) size=%d '%s')\n",
                     self->interpStackStart, self->interpStackEnd, bottom,
-                    self->interpStackSize, methodToCall->name);
-                dvmHandleStackOverflow(self);
+                    (u1*) fp - bottom, self->interpStackSize,
+                    methodToCall->name);
+                dvmHandleStackOverflow(self, methodToCall);
                 assert(dvmCheckException(self));
                 GOTO_exceptionThrown();
             }
@@ -3922,6 +4032,11 @@ GOTO_TARGET(invokeMethod, bool methodCallRange, const Method* _methodToCall,
 
             ILOGD("> native <-- %s.%s %s", methodToCall->clazz->descriptor,
                 methodToCall->name, methodToCall->shorty);
+
+#if defined(WITH_JIT)
+            /* Allow the Jit to end any pending trace building */
+            CHECK_JIT();
+#endif
 
             /*
              * Jump through native call bridge.  Because we leave no

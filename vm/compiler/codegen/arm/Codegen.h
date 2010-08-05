@@ -14,44 +14,66 @@
  * limitations under the License.
  */
 
-#ifndef _DALVIK_VM_COMPILER_CODEGEN_ARM_CODEGEN_H
-#define _DALVIK_VM_COMPILER_CODEGEN_ARM_CODEGEN_H
-
 /*
- * Forward declarations for common routines in Codegen.c used by ISA
- * variant code such as ThumbUtilty.c
+ * This file contains register alloction support and is intended to be
+ * included by:
+ *
+ *        Codegen-$(TARGET_ARCH_VARIANT).c
+ *
  */
 
-static ArmLIR *newLIR0(CompilationUnit *cUnit, ArmOpCode opCode);
-static ArmLIR *newLIR1(CompilationUnit *cUnit, ArmOpCode opCode,
-                           int dest);
-static ArmLIR *newLIR2(CompilationUnit *cUnit, ArmOpCode opCode,
-                           int dest, int src1);
-static ArmLIR *newLIR3(CompilationUnit *cUnit, ArmOpCode opCode,
-                           int dest, int src1, int src2);
-static ArmLIR *newLIR23(CompilationUnit *cUnit, ArmOpCode opCode,
-                            int srcdest, int src2);
-static ArmLIR *scanLiteralPool(CompilationUnit *cUnit, int value,
-                                   unsigned int delta);
-static ArmLIR *addWordData(CompilationUnit *cUnit, int value, bool inPlace);
-static inline ArmLIR *genCheckCommon(CompilationUnit *cUnit, int dOffset,
-                                         ArmLIR *branch,
-                                         ArmLIR *pcrLabel);
+#include "compiler/CompilerIR.h"
+#include "CalloutHelper.h"
 
-/* Routines which must be supplied by the variant-specific code */
-static void genDispatchToHandler(CompilationUnit *cUnit, TemplateOpCode opCode);
-bool dvmCompilerArchInit(void);
-static bool genInlineSqrt(CompilationUnit *cUnit, MIR *mir);
-static bool genInlineCos(CompilationUnit *cUnit, MIR *mir);
-static bool genInlineSin(CompilationUnit *cUnit, MIR *mir);
-static bool genConversion(CompilationUnit *cUnit, MIR *mir);
-static bool genArithOpFloat(CompilationUnit *cUnit, MIR *mir, int vDest,
-                            int vSrc1, int vSrc2);
-static bool genArithOpDouble(CompilationUnit *cUnit, MIR *mir, int vDest,
-                             int vSrc1, int vSrc2);
-static bool genCmpX(CompilationUnit *cUnit, MIR *mir, int vDest, int vSrc1,
-                    int vSrc2);
+/*
+ * loadConstant() sometimes needs to add a small imm to a pre-existing constant
+ */
+static ArmLIR *opRegImm(CompilationUnit *cUnit, OpKind op, int rDestSrc1,
+                        int value);
+static ArmLIR *opRegReg(CompilationUnit *cUnit, OpKind op, int rDestSrc1,
+                        int rSrc2);
 
+/* Forward decalraton the portable versions due to circular dependency */
+static bool genArithOpFloatPortable(CompilationUnit *cUnit, MIR *mir,
+                                    RegLocation rlDest, RegLocation rlSrc1,
+                                    RegLocation rlSrc2);
 
+static bool genArithOpDoublePortable(CompilationUnit *cUnit, MIR *mir,
+                                     RegLocation rlDest, RegLocation rlSrc1,
+                                     RegLocation rlSrc2);
 
-#endif /* _DALVIK_VM_COMPILER_CODEGEN_ARM_CODEGEN_H */
+static bool genConversionPortable(CompilationUnit *cUnit, MIR *mir);
+
+static void genMonitorPortable(CompilationUnit *cUnit, MIR *mir);
+
+static void genInterpSingleStep(CompilationUnit *cUnit, MIR *mir);
+
+#if defined(WITH_SELF_VERIFICATION)
+/* Self Verification memory instruction decoder */
+void dvmSelfVerificationMemOpDecode(int lr, int* sp);
+#endif
+
+/*
+ * Architecture-dependent register allocation routines implemented in
+ * Thumb[2]/Ralloc.c
+ */
+extern int dvmCompilerAllocTypedTempPair(CompilationUnit *cUnit,
+                                         bool fpHint, int regClass);
+
+extern int dvmCompilerAllocTypedTemp(CompilationUnit *cUnit, bool fpHint,
+                                     int regClass);
+
+extern ArmLIR* dvmCompilerRegCopyNoInsert(CompilationUnit *cUnit, int rDest,
+                                          int rSrc);
+
+extern ArmLIR* dvmCompilerRegCopy(CompilationUnit *cUnit, int rDest, int rSrc);
+
+extern void dvmCompilerRegCopyWide(CompilationUnit *cUnit, int destLo,
+                                   int destHi, int srcLo, int srcHi);
+
+extern void dvmCompilerFlushRegImpl(CompilationUnit *cUnit, int rBase,
+                                    int displacement, int rSrc, OpSize size);
+
+extern void dvmCompilerFlushRegWideImpl(CompilationUnit *cUnit, int rBase,
+                                        int displacement, int rSrcLo,
+                                        int rSrcHi);

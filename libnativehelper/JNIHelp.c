@@ -23,12 +23,12 @@ int jniRegisterNativeMethods(JNIEnv* env, const char* className,
     LOGV("Registering %s natives\n", className);
     clazz = (*env)->FindClass(env, className);
     if (clazz == NULL) {
-        LOGE("Native registration unable to find class '%s'\n", className);
-        return -1;
+        LOGW("Native registration unable to find class '%s'\n", className);
+        return 1;
     }
     if ((*env)->RegisterNatives(env, clazz, gMethods, numMethods) < 0) {
-        LOGE("RegisterNatives failed for '%s'\n", className);
-        return -1;
+        LOGW("RegisterNatives failed for '%s'\n", className);
+        return 1;
     }
     return 0;
 }
@@ -42,13 +42,13 @@ int jniThrowException(JNIEnv* env, const char* className, const char* msg)
 
     exceptionClass = (*env)->FindClass(env, className);
     if (exceptionClass == NULL) {
-        LOGE("Unable to find exception class %s\n", className);
+        LOGW("Unable to find exception class %s\n", className);
         assert(0);      /* fatal during dev; should always be fatal? */
-        return -1;
+        return 1;
     }
 
     if ((*env)->ThrowNew(env, exceptionClass, msg) != JNI_OK) {
-        LOGE("Failed throwing '%s' '%s'\n", className, msg);
+        LOGW("Failed throwing '%s' '%s'\n", className, msg);
         assert(!"failed to throw");
     }
     return 0;

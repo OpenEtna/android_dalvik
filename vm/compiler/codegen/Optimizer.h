@@ -14,29 +14,25 @@
  * limitations under the License.
  */
 
-#include "Dalvik.h"
-#include "compiler/CompilerInternals.h"
-
 #ifndef _DALVIK_VM_COMPILER_OPTIMIZATION_H
 #define _DALVIK_VM_COMPILER_OPTIMIZATION_H
+
+#include "Dalvik.h"
+
+/*
+ * If the corresponding bit is set in gDvmJit.disableOpt, the selected
+ * optimization will be suppressed.
+ */
+typedef enum optControlVector {
+    kLoadStoreElimination = 0,
+    kLoadHoisting,
+    kTrackLiveTemps,
+    kSuppressLoads,
+} optControlVector;
 
 /* Forward declarations */
 struct CompilationUnit;
 struct LIR;
-
-/*
- * Data structure tracking the mapping between a Dalvik register (pair) and a
- * native register (pair). The idea is to reuse the previously loaded value
- * if possible, otherwise to keep the value in a native register as long as
- * possible.
- */
-typedef struct RegisterScoreboard {
-    BitVector *nullCheckedRegs; // Track which registers have been null-checked
-    int liveDalvikReg;          // Track which Dalvik register is live
-    int nativeReg;              // And the mapped native register
-    int nativeRegHi;            // And the mapped native register
-    bool isWide;                // Whether a pair of registers are alive
-} RegisterScoreboard;
 
 void dvmCompilerApplyLocalOptimizations(struct CompilationUnit *cUnit,
                                         struct LIR *head,

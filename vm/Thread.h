@@ -22,6 +22,9 @@
 
 #include "jni.h"
 
+#include <cutils/sched_policy.h>
+
+
 #if defined(CHECK_MUTEX) && !defined(__USE_UNIX98)
 /* glibc lacks this unless you #define __USE_UNIX98 */
 int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int type);
@@ -157,6 +160,16 @@ typedef struct Thread {
     /* internal reference tracking */
     ReferenceTable  internalLocalRefTable;
 
+#if defined(WITH_JIT)
+    /*
+     * Whether the current top VM frame is in the interpreter or JIT cache:
+     *   NULL    : in the interpreter
+     *   non-NULL: entry address of the JIT'ed code (the actual value doesn't
+     *             matter)
+     */
+    void*       inJitCodeCache;
+#endif
+
     /* JNI local reference tracking */
 #ifdef USE_INDIRECT_REF
     IndirectRefTable jniLocalRefTable;
@@ -170,14 +183,23 @@ typedef struct Thread {
     /* hack to make JNI_OnLoad work right */
     Object*     classLoaderOverride;
 
+    /* mutex to guard the interrupted and the waitMonitor members */
+    pthread_mutex_t    waitMutex;
+
     /* pointer to the monitor lock we're currently waiting on */
-    /* (do not set or clear unless the Monitor itself is held) */
+    /* guarded by waitMutex */
     /* TODO: consider changing this to Object* for better JDWP interaction */
     Monitor*    waitMonitor;
-    /* set when we confirm that the thread must be interrupted from a wait */
-    bool        interruptingWait;
+
     /* thread "interrupted" status; stays raised until queried or thrown */
+    /* guarded by waitMutex */
     bool        interrupted;
+
+    /* links to the next thread in the wait set this thread is part of */
+    struct Thread*     waitNext;
+
+    /* object to sleep on while we are waiting for a monitor */
+    pthread_cond_t     waitCond;
 
     /*
      * Set to true when the thread is in the process of throwing an
@@ -188,6 +210,9 @@ typedef struct Thread {
     /* links to rest of thread list; grab global lock before traversing */
     struct Thread* prev;
     struct Thread* next;
+
+    /* used by threadExitCheck when a thread exits without detaching */
+    int         threadExitCheckCount;
 
     /* JDWP invoke-during-breakpoint support */
     DebugInvokeReq  invokeReq;
@@ -218,6 +243,11 @@ typedef struct Thread {
 #if WITH_EXTRA_GC_CHECKS > 1
     /* PC, saved on every instruction; redundant with StackSaveArea */
     const u2*   currentPc2;
+#endif
+
+#if defined(WITH_SELF_VERIFICATION)
+    /* Buffer for register state during self verification */
+    struct ShadowSpace* shadowSpace;
 #endif
 
     /* system thread state */
@@ -270,7 +300,10 @@ typedef enum SuspendCause {
     SUSPEND_FOR_STACK_DUMP,
     SUSPEND_FOR_DEX_OPT,
 #if defined(WITH_JIT)
-    SUSPEND_FOR_JIT,
+    SUSPEND_FOR_TBL_RESIZE,  // jit-table resize
+    SUSPEND_FOR_IC_PATCH,    // polymorphic callsite inline-cache patch
+    SUSPEND_FOR_CC_RESET,    // code-cache reset
+    SUSPEND_FOR_REFRESH,     // Reload data cached in interpState
 #endif
 } SuspendCause;
 void dvmSuspendThread(Thread* thread);
@@ -349,6 +382,14 @@ INLINE void dvmLockMutex(pthread_mutex_t* pMutex)
 }
 
 /*
+ * Try grabbing a plain mutex.  Returns 0 if successful.
+ */
+INLINE int dvmTryLockMutex(pthread_mutex_t* pMutex)
+{
+    return pthread_mutex_trylock(pMutex);
+}
+
+/*
  * Unlock pthread mutex.
  */
 INLINE void dvmUnlockMutex(pthread_mutex_t* pMutex)
@@ -396,6 +437,22 @@ Object* dvmGetSystemThreadGroup(void);
 Thread* dvmGetThreadFromThreadObject(Object* vmThreadObj);
 
 /*
+ * Given a pthread handle, return the associated Thread*.
+ * Caller must hold the thread list lock.
+ *
+ * Returns NULL if the thread was not found.
+ */
+Thread* dvmGetThreadByHandle(pthread_t handle);
+
+/*
+ * Given a thread ID, return the associated Thread*.
+ * Caller must hold the thread list lock.
+ *
+ * Returns NULL if the thread was not found.
+ */
+Thread* dvmGetThreadByThreadId(u4 threadId);
+
+/*
  * Sleep in a thread.  Returns when the sleep timer returns or the thread
  * is interrupted.
  */
@@ -405,6 +462,11 @@ void dvmThreadSleep(u8 msec, u4 nsec);
  * Get the name of a thread.  (For safety, hold the thread list lock.)
  */
 char* dvmGetThreadName(Thread* thread);
+
+/*
+ * Convert ThreadStatus to a string.
+ */
+const char* dvmGetThreadStatusStr(ThreadStatus status);
 
 /*
  * Return true if a thread is on the internal list.  If it is, the
@@ -423,6 +485,25 @@ INLINE void dvmSetThreadJNIEnv(Thread* self, JNIEnv* env) { self->jniEnv = env;}
  */
 void dvmChangeThreadPriority(Thread* thread, int newPriority);
 
+/* "change flags" values for raise/reset thread priority calls */
+#define kChangedPriority    0x01
+#define kChangedPolicy      0x02
+
+/*
+ * If necessary, raise the thread's priority to nice=0 cgroup=fg.
+ *
+ * Returns bit flags indicating changes made (zero if nothing was done).
+ */
+int dvmRaiseThreadPriorityIfNeeded(Thread* thread, int* pSavedThreadPrio,
+    SchedPolicy* pSavedThreadPolicy);
+
+/*
+ * Drop the thread priority to what it was before an earlier call to
+ * dvmRaiseThreadPriorityIfNeeded().
+ */
+void dvmResetThreadPriority(Thread* thread, int changeFlags,
+    int savedThreadPrio, SchedPolicy savedThreadPolicy);
+
 /*
  * Debug: dump information about a single thread.
  */
@@ -435,6 +516,12 @@ void dvmDumpThreadEx(const DebugOutputTarget* target, Thread* thread,
  */
 void dvmDumpAllThreads(bool grabLock);
 void dvmDumpAllThreadsEx(const DebugOutputTarget* target, bool grabLock);
+
+/*
+ * Debug: kill a thread to get a debuggerd stack trace.  Leaves the VM
+ * in an uncertain state.
+ */
+void dvmNukeThread(Thread* thread);
 
 #ifdef WITH_MONITOR_TRACKING
 /*

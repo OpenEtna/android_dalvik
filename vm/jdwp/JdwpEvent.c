@@ -1026,6 +1026,10 @@ bool dvmJdwpPostVMDeath(JdwpState* state)
  * Valid mods:
  *  Count, ThreadOnly, ClassOnly, ClassMatch, ClassExclude, LocationOnly,
  *    ExceptionOnly, InstanceOnly
+ *
+ * The "exceptionId" has not been added to the GC-visible object registry,
+ * because there's a pretty good chance that we're not going to send it
+ * up the debugger.
  */
 bool dvmJdwpPostException(JdwpState* state, const JdwpLocation* pThrowLoc,
     ObjectId exceptionId, RefTypeId exceptionClassId,
@@ -1100,6 +1104,9 @@ bool dvmJdwpPostException(JdwpState* state, const JdwpLocation* pThrowLoc,
             expandBufAdd8BE(pReq, exceptionId);
             dvmJdwpAddLocation(pReq, pCatchLoc);
         }
+
+        /* don't let the GC discard it */
+        dvmDbgRegisterObjectId(exceptionId);
     }
 
     cleanupMatchList(state, matchList, matchCount);
@@ -1251,40 +1258,39 @@ bool dvmJdwpPostFieldAccess(JdwpState* state, int STUFF, ObjectId thisPtr,
  * other debugger traffic, and can't suspend the VM, so we skip all of
  * the fun event token gymnastics.
  */
-void dvmJdwpDdmSendChunk(JdwpState* state, int type, int len, const u1* buf)
+void dvmJdwpDdmSendChunkV(JdwpState* state, int type, const struct iovec* iov,
+    int iovcnt)
 {
-    ExpandBuf* pReq;
-    u1* outBuf;
+    u1 header[kJDWPHeaderLen + 8];
+    size_t dataLen = 0;
+    int i;
+
+    assert(iov != NULL);
+    assert(iovcnt > 0 && iovcnt < 10);
 
     /*
-     * Write the chunk header and data into the ExpandBuf.
+     * "Wrap" the contents of the iovec with a JDWP/DDMS header.  We do
+     * this by creating a new copy of the vector with space for the header.
      */
-    pReq = expandBufAlloc();
-    expandBufAddSpace(pReq, kJDWPHeaderLen);
-    expandBufAdd4BE(pReq, type);
-    expandBufAdd4BE(pReq, len);
-    if (len > 0) {
-        outBuf = expandBufAddSpace(pReq, len);
-        memcpy(outBuf, buf, len);
+    struct iovec wrapiov[iovcnt+1];
+    for (i = 0; i < iovcnt; i++) {
+        wrapiov[i+1].iov_base = iov[i].iov_base;
+        wrapiov[i+1].iov_len = iov[i].iov_len;
+        dataLen += iov[i].iov_len;
     }
 
-    /*
-     * Go back and write the JDWP header.
-     */
-    outBuf = expandBufGetBuffer(pReq);
+    /* form the header (JDWP plus DDMS) */
+    set4BE(header, sizeof(header) + dataLen);
+    set4BE(header+4, dvmJdwpNextRequestSerial(state));
+    set1(header+8, 0);     /* flags */
+    set1(header+9, kJDWPDdmCmdSet);
+    set1(header+10, kJDWPDdmCmd);
+    set4BE(header+11, type);
+    set4BE(header+15, dataLen);
 
-    set4BE(outBuf, expandBufGetLength(pReq));
-    set4BE(outBuf+4, dvmJdwpNextRequestSerial(state));
-    set1(outBuf+8, 0);     /* flags */
-    set1(outBuf+9, kJDWPDdmCmdSet);
-    set1(outBuf+10, kJDWPDdmCmd);
+    wrapiov[0].iov_base = header;
+    wrapiov[0].iov_len = sizeof(header);
 
-    /*
-     * Send it up.
-     */
-    //LOGD("Sending chunk (type=0x%08x len=%d)\n", type, len);
-    dvmJdwpSendRequest(state, pReq);
-
-    expandBufFree(pReq);
+    dvmJdwpSendBufferedRequest(state, wrapiov, iovcnt+1);
 }
 

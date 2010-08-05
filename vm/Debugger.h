@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 /*
  * Dalvik-specific side of debugger support.  (The JDWP code is intended to
  * be relatively generic.)
@@ -32,7 +33,7 @@ struct Method;
 struct Thread;
 
 /*
- * used by StepControl to track a set of addresses associated with
+ * Used by StepControl to track a set of addresses associated with
  * a single line.
  */
 typedef struct AddressSet {
@@ -159,6 +160,7 @@ void dvmDbgExit(int status);
  * Class, Object, Array
  */
 const char* dvmDbgGetClassDescriptor(RefTypeId id);
+ObjectId dvmDbgGetClassObject(RefTypeId id);
 RefTypeId dvmDbgGetSuperclass(RefTypeId id);
 ObjectId dvmDbgGetClassLoader(RefTypeId id);
 u4 dvmDbgGetAccessFlags(RefTypeId id);
@@ -188,6 +190,7 @@ bool dvmDbgSetArrayElements(ObjectId arrayId, int firstIndex, int count,
     const u1* buf);
 
 ObjectId dvmDbgCreateString(const char* str);
+ObjectId dvmDbgCreateObject(RefTypeId classId);
 
 bool dvmDbgMatchType(RefTypeId instClassId, RefTypeId classId);
 
@@ -288,6 +291,9 @@ void dvmDbgExecuteMethod(DebugInvokeReq* pReq);
 /* Make an AddressSet for a line, for single stepping */
 const AddressSet *dvmAddressSetForLine(const struct Method* method, int line);
 
+/* perform "late registration" of an object ID */
+void dvmDbgRegisterObjectId(ObjectId id);
+
 /*
  * DDM support.
  */
@@ -295,7 +301,8 @@ bool dvmDbgDdmHandlePacket(const u1* buf, int dataLen, u1** pReplyBuf,
     int* pReplyLen);
 void dvmDbgDdmConnected(void);
 void dvmDbgDdmDisconnected(void);
-void dvmDbgDdmSendChunk(int type, int len, const u1* buf);
+void dvmDbgDdmSendChunk(int type, size_t len, const u1* buf);
+void dvmDbgDdmSendChunkV(int type, const struct iovec* iov, int iovcnt);
 
 #define CHUNK_TYPE(_name) \
     ((_name)[0] << 24 | (_name)[1] << 16 | (_name)[2] << 8 | (_name)[3])

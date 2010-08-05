@@ -34,8 +34,9 @@
 
 #define MAX_BREAKPOINTS 20      /* used for a debugger optimization */
 
-// fwd
-typedef struct GcHeap GcHeap;   /* heap internal structure */
+/* private structures */
+typedef struct GcHeap GcHeap;
+typedef struct BreakpointSet BreakpointSet;
 
 /*
  * One of these for each -ea/-da/-esa/-dsa on the command line.
@@ -79,6 +80,7 @@ struct DvmGlobals {
     bool        verboseGc;
     bool        verboseJni;
     bool        verboseClass;
+    bool        verboseShutdown;
 
     bool        jdwpAllowed;        // debugging allowed for this process?
     bool        jdwpConfigured;     // has debugging info been provided?
@@ -87,6 +89,14 @@ struct DvmGlobals {
     char*       jdwpHost;
     int         jdwpPort;
     bool        jdwpSuspend;
+
+    /*
+     * Lock profiling threshold value in milliseconds.  Acquires that
+     * exceed threshold are logged.  Acquires within the threshold are
+     * logged with a probability of $\frac{time}{threshold}$ .  If the
+     * threshold is unset no additional logging occurs.
+     */
+    u4          lockProfThreshold;
 
     int         (*vfprintfHook)(FILE*, const char*, va_list);
     void        (*exitHook)(int);
@@ -174,6 +184,7 @@ struct DvmGlobals {
     ClassObject* classJavaLangVMThread;
     ClassObject* classJavaLangThreadGroup;
     ClassObject* classJavaLangThrowable;
+    ClassObject* classJavaLangStackOverflowError;
     ClassObject* classJavaLangStackTraceElement;
     ClassObject* classJavaLangStackTraceElementArray;
     ClassObject* classJavaLangAnnotationAnnotationArray;
@@ -187,6 +198,7 @@ struct DvmGlobals {
     ClassObject* classJavaLangReflectMethodArray;
     ClassObject* classJavaLangReflectProxy;
     ClassObject* classJavaLangExceptionInInitializerError;
+    ClassObject* classJavaLangRefPhantomReference;
     ClassObject* classJavaLangRefReference;
     ClassObject* classJavaNioReadWriteDirectByteBuffer;
     ClassObject* classJavaSecurityAccessController;
@@ -259,14 +271,8 @@ struct DvmGlobals {
     int         offJavaLangRefReference_queueNext;
     int         offJavaLangRefReference_vmData;
 
-#if FANCY_REFERENCE_SUBCLASS
-    /* method offsets - java.lang.ref.Reference */
-    int         voffJavaLangRefReference_clear;
-    int         voffJavaLangRefReference_enqueue;
-#else
     /* method pointers - java.lang.ref.Reference */
     Method*     methJavaLangRefReference_enqueueInternal;
-#endif
 
     /* field offsets - java.nio.Buffer and java.nio.DirectByteBufferImpl */
     //int         offJavaNioBuffer_capacity;
@@ -279,6 +285,7 @@ struct DvmGlobals {
     /* constructor method pointers; no vtable involved, so use Method* */
     Method*     methJavaLangStackTraceElement_init;
     Method*     methJavaLangExceptionInInitializerError_init;
+    Method*     methJavaLangRefPhantomReference_init;
     Method*     methJavaLangReflectConstructor_init;
     Method*     methJavaLangReflectField_init;
     Method*     methJavaLangReflectMethod_init;
@@ -425,6 +432,9 @@ struct DvmGlobals {
     ReferenceTable  jniPinRefTable;
     pthread_mutex_t jniPinRefLock;
 
+    /* special ReferenceQueue for JNI weak globals */
+    Object*     jniWeakGlobalRefQueue;
+
     /*
      * Native shared library table.
      */
@@ -523,12 +533,9 @@ struct DvmGlobals {
     HashTable*  dbgRegistry;
 
     /*
-     * Breakpoint optimization table.  This is global and NOT explicitly
-     * synchronized, but all operations that modify the table are made
-     * from relatively-synchronized functions.  False-positives are
-     * possible, false-negatives (i.e. missing a breakpoint) should not be.
+     * Debugger breakpoint table.
      */
-    const u2*   debugBreakAddr[MAX_BREAKPOINTS];
+    BreakpointSet*  breakpointSet;
 
     /*
      * Single-step control struct.  We currently only allow one thread to
@@ -649,6 +656,19 @@ extern struct DvmGlobals gDvm;
 #if defined(WITH_JIT)
 
 /*
+ * Exiting the compiled code w/o chaining will incur overhead to look up the
+ * target in the code cache which is extra work only when JIT is enabled. So
+ * we want to monitor it closely to make sure we don't have performance bugs.
+ */
+typedef enum NoChainExits {
+    kInlineCacheMiss = 0,
+    kCallsiteInterpreted,
+    kSwitchOverflow,
+    kHeavyweightMonitor,
+    kNoChainExitLast,
+} NoChainExits;
+
+/*
  * JIT-specific global state
  */
 struct DvmJitGlobals {
@@ -675,6 +695,8 @@ struct DvmJitGlobals {
 
     /* Array of profile threshold counters */
     unsigned char *pProfTable;
+
+    /* Copy of pProfTable used for temporarily disabling the Jit */
     unsigned char *pProfTableCopy;
 
     /* Size of JIT hash table in entries.  Must be a power of 2 */
@@ -686,6 +708,9 @@ struct DvmJitGlobals {
     /* How many entries in the JitEntryTable are in use */
     unsigned int jitTableEntriesUsed;
 
+    /* Bytes allocated for the code cache */
+    unsigned int codeCacheSize;
+
     /* Trigger for trace selection */
     unsigned short threshold;
 
@@ -694,26 +719,31 @@ struct DvmJitGlobals {
     bool               blockingMode;
     pthread_t          compilerHandle;
     pthread_mutex_t    compilerLock;
+    pthread_mutex_t    compilerICPatchLock;
     pthread_cond_t     compilerQueueActivity;
     pthread_cond_t     compilerQueueEmpty;
-    int                compilerQueueLength;
+    volatile int       compilerQueueLength;
     int                compilerHighWater;
     int                compilerWorkEnqueueIndex;
     int                compilerWorkDequeueIndex;
-    CompilerWorkOrder  compilerWorkQueue[COMPILER_WORK_QUEUE_SIZE];
+    int                compilerICPatchIndex;
 
     /* JIT internal stats */
     int                compilerMaxQueued;
     int                addrLookupsFound;
     int                addrLookupsNotFound;
-    int                noChainExit;
+    int                noChainExit[kNoChainExitLast];
     int                normalExit;
     int                puntExit;
     int                translationChains;
-    int                invokeChain;
-    int                invokePredictedChain;
+    int                invokeMonomorphic;
+    int                invokePolymorphic;
     int                invokeNative;
     int                returnOp;
+    int                icPatchFast;
+    int                icPatchQueued;
+    int                icPatchDropped;
+    u8                 jitTime;
 
     /* Compiled code cache */
     void* codeCache;
@@ -729,6 +759,12 @@ struct DvmJitGlobals {
 
     /* Flag to indicate that the code cache is full */
     bool codeCacheFull;
+
+    /* Number of times that the code cache has been reset */
+    int numCodeCacheReset;
+
+    /* Number of times that the code cache reset request has been delayed */
+    int numCodeCacheResetDelayed;
 
     /* true/false: compile/reject opcodes specified in the -Xjitop list */
     bool includeSelectedOp;
@@ -748,8 +784,48 @@ struct DvmJitGlobals {
     /* Flag to count trace execution */
     bool profile;
 
+    /* Vector to disable selected optimizations */
+    int disableOpt;
+
+    /* Code address of special interpret-only pseudo-translation */
+    void *interpretTemplate;
+
     /* Table to track the overall and trace statistics of hot methods */
     HashTable*  methodStatsTable;
+
+    /* Filter method compilation blacklist with call-graph information */
+    bool checkCallGraph;
+
+    /* New translation chain has been set up */
+    volatile bool hasNewChain;
+
+#if defined(WITH_SELF_VERIFICATION)
+    /* Spin when error is detected, volatile so GDB can reset it */
+    volatile bool selfVerificationSpin;
+#endif
+
+    /* Framework or stand-alone? */
+    bool runningInAndroidFramework;
+
+    /* Framework callback happened? */
+    bool alreadyEnabledViaFramework;
+
+    /* Framework requests to disable the JIT for good */
+    bool disableJit;
+
+#if defined(SIGNATURE_BREAKPOINT)
+    /* Signature breakpoint */
+    u4 signatureBreakpointSize;         // # of words
+    u4 *signatureBreakpoint;            // Signature content
+#endif
+
+    /* Place arrays at the end to ease the display in gdb sessions */
+
+    /* Work order queue for compilations */
+    CompilerWorkOrder compilerWorkQueue[COMPILER_WORK_QUEUE_SIZE];
+
+    /* Work order queue for predicted chain patching */
+    ICPatchWorkOrder compilerICPatchQueue[COMPILER_IC_PATCH_QUEUE_SIZE];
 };
 
 extern struct DvmJitGlobals gDvmJit;

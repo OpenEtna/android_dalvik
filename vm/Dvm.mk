@@ -15,8 +15,9 @@
 #
 # Common definitions for host or target builds of libdvm.
 #
-# If you enable or disable optional features here,
-# rebuild the VM with "make clean-libdvm && make -j4 libdvm".
+# If you enable or disable optional features here, make sure you do
+# a "clean" build -- not everything depends on Dalvik.h.  (See Android.mk
+# for the exact command.)
 #
 
 
@@ -122,6 +123,7 @@ LOCAL_SRC_FILES := \
 	SignalCatcher.c \
 	StdioConverter.c \
 	Sync.c \
+	TestCompability.c \
 	Thread.c \
 	UtfString.c \
 	alloc/clz.c.arm \
@@ -194,11 +196,7 @@ LOCAL_SRC_FILES := \
 	test/TestHash.c \
 	test/TestIndirectRefTable.c
 
-ifeq ($(WITH_JIT_TUNING),true)
-  LOCAL_CFLAGS += -DWITH_JIT_TUNING
-  # NOTE: Turn on assertion for JIT for now
-  LOCAL_CFLAGS += -UNDEBUG -DDEBUG=1 -DLOG_NDEBUG=1 -DWITH_DALVIK_ASSERT
-endif
+WITH_JIT := $(strip $(WITH_JIT))
 
 ifeq ($(WITH_JIT),true)
   LOCAL_CFLAGS += -DWITH_JIT
@@ -208,6 +206,9 @@ ifeq ($(WITH_JIT),true)
 	compiler/Frontend.c \
 	compiler/Utility.c \
 	compiler/IntermediateRep.c \
+	compiler/Dataflow.c \
+	compiler/Loop.c \
+	compiler/Ralloc.c \
 	interp/Jit.c
 endif
 
@@ -276,7 +277,9 @@ ifeq ($(dvm_arch),arm)
 
   ifeq ($(WITH_JIT),true)
     LOCAL_SRC_FILES += \
-		compiler/codegen/arm/Codegen-$(dvm_arch_variant).c \
+		compiler/codegen/arm/RallocUtil.c \
+		compiler/codegen/arm/$(dvm_arch_variant)/Codegen.c \
+		compiler/codegen/arm/$(dvm_arch_variant)/CallingConvention.S \
 		compiler/codegen/arm/Assemble.c \
 		compiler/codegen/arm/ArchUtility.c \
 		compiler/codegen/arm/LocalOptimizations.c \
@@ -289,10 +292,10 @@ ifeq ($(dvm_arch),x86)
   ifeq ($(dvm_os),linux)
     MTERP_ARCH_KNOWN := true
     LOCAL_SRC_FILES += \
-		arch/x86/Call386ABI.S \
-		arch/x86/Hints386ABI.c \
-		mterp/out/InterpC-x86.c \
-		mterp/out/InterpAsm-x86.S
+		arch/$(dvm_arch_variant)/Call386ABI.S \
+		arch/$(dvm_arch_variant)/Hints386ABI.c \
+		mterp/out/InterpC-$(dvm_arch_variant).c \
+		mterp/out/InterpAsm-$(dvm_arch_variant).S
   endif
 endif
 
@@ -308,7 +311,13 @@ endif
 ifeq ($(MTERP_ARCH_KNOWN),false)
   # unknown architecture, try to use FFI
   LOCAL_C_INCLUDES += external/libffi/$(dvm_os)-$(dvm_arch)
-  LOCAL_SHARED_LIBRARIES += libffi
+
+  ifeq ($(dvm_os)-$(dvm_arch),darwin-x86)
+      # OSX includes libffi, so just make the linker aware of it directly.
+      LOCAL_LDLIBS += -lffi
+  else
+      LOCAL_SHARED_LIBRARIES += libffi
+  endif
 
   LOCAL_SRC_FILES += \
 		arch/generic/Call.c \
@@ -323,9 +332,6 @@ ifeq ($(MTERP_ARCH_KNOWN),false)
 	-DdvmAsmSisterStart=0 -DdvmAsmSisterEnd=0 -DDVM_NO_ASM_INTERP=1
 endif
 
-LOCAL_SHARED_LIBRARIES += \
-	libnativehelper \
-	libz
-
-LOCAL_STATIC_LIBRARIES += \
-	libdex
+ifeq ($(TEST_VM_IN_ECLAIR),true)
+  LOCAL_CFLAGS += -DTEST_VM_IN_ECLAIR
+endif

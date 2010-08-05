@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
-#include "../CompilerIR.h"
-
 #ifndef _DALVIK_VM_COMPILERCODEGEN_H_
 #define _DALVIK_VM_COMPILERCODEGEN_H_
+
+#include "compiler/CompilerIR.h"
+
+/* Maximal number of switch cases to have inline chains */
+#define MAX_CHAINED_SWITCH_CASES 64
 
 /* Work unit is architecture dependent */
 bool dvmCompilerDoWork(CompilerWorkOrder *work);
@@ -28,6 +31,9 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit);
 /* Assemble LIR into machine code */
 void dvmCompilerAssembleLIR(CompilationUnit *cUnit, JitTranslationInfo *info);
 
+/* Patch inline cache content for polymorphic callsites */
+bool dvmJitPatchInlineCache(void *cellPtr, void *contentPtr);
+
 /* Implemented in the codegen/<target>/ArchUtility.c */
 void dvmCompilerCodegenDump(CompilationUnit *cUnit);
 
@@ -35,8 +41,24 @@ void dvmCompilerCodegenDump(CompilationUnit *cUnit);
 void* dvmJitChain(void *tgtAddr, u4* branchAddr);
 u4* dvmJitUnchain(void *codeAddr);
 void dvmJitUnchainAll(void);
+void dvmCompilerPatchInlineCache(void);
+
+/* Implemented in codegen/<target>/Ralloc.c */
+void dvmCompilerRegAlloc(CompilationUnit *cUnit);
+
+/* Implemented in codegen/<target>/Thumb<version>Util.c */
+void dvmCompilerInitializeRegAlloc(CompilationUnit *cUnit);
 
 /* Implemented in codegen/<target>/<target_variant>/ArchVariant.c */
-JitInstructionSetType dvmCompilerInstructionSet(CompilationUnit *cUnit);
+JitInstructionSetType dvmCompilerInstructionSet(void);
+
+/*
+ * Implemented in codegen/<target>/<target_variant>/ArchVariant.c
+ * Architecture-specific initializations and checks
+ */
+bool dvmCompilerArchVariantInit(void);
+
+/* Implemented in codegen/<target>/<target_variant>/ArchVariant.c */
+int dvmCompilerTargetOptHint(int key);
 
 #endif /* _DALVIK_VM_COMPILERCODEGEN_H_ */

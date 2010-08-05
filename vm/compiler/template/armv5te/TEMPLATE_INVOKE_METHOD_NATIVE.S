@@ -22,11 +22,17 @@
     str     r0, [r1, #(offStackSaveArea_method - sizeofStackSaveArea)]
     cmp     r8, #0                      @ suspendCount != 0
     ldr     r8, [r0, #offMethod_nativeFunc] @ r8<- method->nativeFunc
+#if !defined(WITH_SELF_VERIFICATION)
     bxne    lr                          @ bail to the interpreter
+#else
+    bx      lr                          @ bail to interpreter unconditionally
+#endif
 
     @ go ahead and transfer control to the native code
     ldr     r9, [r3, #offThread_jniLocal_topCookie] @ r9<- thread->localRef->...
+    mov     r2, #0
     str     r1, [r3, #offThread_curFrame]   @ self->curFrame = newFp
+    str     r2, [r3, #offThread_inJitCodeCache] @ not in the jit code cache
     str     r9, [r1, #(offStackSaveArea_localRefCookie - sizeofStackSaveArea)]
                                         @ newFp->localRefCookie=top
     mov     r9, r3                      @ r9<- glue->self (preserve)
@@ -46,6 +52,22 @@
     str     rFP, [r9, #offThread_curFrame]  @ self->curFrame = fp
     cmp     r1, #0                      @ null?
     str     r0, [r9, #offThread_jniLocal_topCookie] @ new top <- old top
-    bne     .LhandleException             @ no, handle exception
-    bx      r2
+    ldr     r0, [rFP, #(offStackSaveArea_currentPc - sizeofStackSaveArea)]
+
+    @ r0 = dalvikCallsitePC
+    bne     .LhandleException           @ no, handle exception
+
+    str     r2, [r9, #offThread_inJitCodeCache] @ set the mode properly
+    cmp     r2, #0                      @ return chaining cell still exists?
+    bxne    r2                          @ yes - go ahead
+
+    @ continue executing the next instruction through the interpreter
+    ldr     r1, .LdvmJitToInterpTraceSelectNoChain @ defined in footer.S
+    add     rPC, r0, #6                 @ reconstruct new rPC (advance 6 bytes)
+#if defined(JIT_STATS)
+    mov     r0, #kCallsiteInterpreted
+#endif
+    mov     pc, r1
+
+
 

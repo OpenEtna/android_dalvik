@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 /*
  * Stacks and their uses (e.g. native --> interpreted method calls).
  *
@@ -80,7 +81,7 @@ static bool dvmPushInterpFrame(Thread* self, const Method* method)
              "(req=%d top=%p cur=%p size=%d %s.%s)\n",
             stackReq, self->interpStackStart, self->curFrame,
             self->interpStackSize, method->clazz->descriptor, method->name);
-        dvmHandleStackOverflow(self);
+        dvmHandleStackOverflow(self, method);
         assert(dvmCheckException(self));
         return false;
     }
@@ -153,7 +154,7 @@ bool dvmPushJNIFrame(Thread* self, const Method* method)
              "(req=%d top=%p cur=%p size=%d '%s')\n",
             stackReq, self->interpStackStart, self->curFrame,
             self->interpStackSize, method->name);
-        dvmHandleStackOverflow(self);
+        dvmHandleStackOverflow(self, method);
         assert(dvmCheckException(self));
         return false;
     }
@@ -227,7 +228,7 @@ bool dvmPushLocalFrame(Thread* self, const Method* method)
              "(req=%d top=%p cur=%p size=%d '%s')\n",
             stackReq, self->interpStackStart, self->curFrame,
             self->interpStackSize, method->name);
-        dvmHandleStackOverflow(self);
+        dvmHandleStackOverflow(self, method);
         assert(dvmCheckException(self));
         return false;
     }
@@ -370,10 +371,10 @@ static ClassObject* callPrep(Thread* self, const Method* method, Object* obj,
 
     assert(self != NULL);
     assert(method != NULL);
-    
+
     if( method == 0xFFFFFFFF ) {
-      LOGE("ERROR: Calling native stub function, returning\n");
-      return NULL;
+          LOGE("ERROR: Calling native stub function, returning\n");
+          return NULL;
     }
 
     if (obj != NULL)
@@ -1019,7 +1020,7 @@ bool dvmCreateStackTraceArray(const void* fp, const Method*** pArray,
  * need to resolve classes, which requires calling into the class loader if
  * the classes aren't already in the "initiating loader" list.
  */
-void dvmHandleStackOverflow(Thread* self)
+void dvmHandleStackOverflow(Thread* self, const Method* method)
 {
     /*
      * Can we make the reserved area available?
@@ -1035,7 +1036,15 @@ void dvmHandleStackOverflow(Thread* self)
     }
 
     /* open it up to the full range */
-    LOGI("Stack overflow, expanding (%p to %p)\n", self->interpStackEnd,
+    LOGI("threadid=%d: stack overflow on call to %s.%s:%s\n",
+        self->threadId,
+        method->clazz->descriptor, method->name, method->shorty);
+    StackSaveArea* saveArea = SAVEAREA_FROM_FP(self->curFrame);
+    LOGI("  method requires %d+%d+%d=%d bytes, fp is %p (%d left)\n",
+        method->registersSize * 4, sizeof(StackSaveArea), method->outsSize * 4,
+        (method->registersSize + method->outsSize) * 4 + sizeof(StackSaveArea),
+        saveArea, (u1*) saveArea - self->interpStackEnd);
+    LOGI("  expanding stack end (%p to %p)\n", self->interpStackEnd,
         self->interpStackStart - self->interpStackSize);
     //dvmDumpThread(self, false);
     self->interpStackEnd = self->interpStackStart - self->interpStackSize;
@@ -1052,18 +1061,24 @@ void dvmHandleStackOverflow(Thread* self)
         LOGW("Stack overflow while throwing exception\n");
         dvmClearException(self);
     }
-    dvmThrowChainedException("Ljava/lang/StackOverflowError;", NULL, excep);
+    dvmThrowChainedExceptionByClass(gDvm.classJavaLangStackOverflowError,
+        NULL, excep);
 }
 
 /*
  * Reduce the available stack size.  By this point we should have finished
  * our overflow processing.
  */
-void dvmCleanupStackOverflow(Thread* self)
+void dvmCleanupStackOverflow(Thread* self, const Object* exception)
 {
     const u1* newStackEnd;
 
     assert(self->stackOverflowed);
+
+    if (exception->clazz != gDvm.classJavaLangStackOverflowError) {
+        /* exception caused during SOE, not the SOE itself */
+        return;
+    }
 
     newStackEnd = (self->interpStackStart - self->interpStackSize)
         + STACK_OVERFLOW_RESERVE;
@@ -1081,6 +1096,85 @@ void dvmCleanupStackOverflow(Thread* self)
         self->curFrame);
 }
 
+
+/*
+ * Extract the object that is the target of a monitor-enter instruction
+ * in the top stack frame of "thread".
+ *
+ * The other thread might be alive, so this has to work carefully.
+ *
+ * We assume the thread list lock is currently held.
+ *
+ * Returns "true" if we successfully recover the object.  "*pOwner" will
+ * be NULL if we can't determine the owner for some reason (e.g. race
+ * condition on ownership transfer).
+ */
+static bool extractMonitorEnterObject(Thread* thread, Object** pLockObj,
+    Thread** pOwner)
+{
+    void* framePtr = thread->curFrame;
+
+    if (framePtr == NULL || dvmIsBreakFrame(framePtr))
+        return false;
+
+    const StackSaveArea* saveArea = SAVEAREA_FROM_FP(framePtr);
+    const Method* method = saveArea->method;
+    const u2* currentPc = saveArea->xtra.currentPc;
+
+    /* check Method* */
+    if (!dvmLinearAllocContains(method, sizeof(Method))) {
+        LOGD("ExtrMon: method %p not valid\n", method);
+        return false;
+    }
+
+    /* check currentPc */
+    u4 insnsSize = dvmGetMethodInsnsSize(method);
+    if (currentPc < method->insns ||
+        currentPc >= method->insns + insnsSize)
+    {
+        LOGD("ExtrMon: insns %p not valid (%p - %p)\n",
+            currentPc, method->insns, method->insns + insnsSize);
+        return false;
+    }
+
+    /* check the instruction */
+    if ((*currentPc & 0xff) != OP_MONITOR_ENTER) {
+        LOGD("ExtrMon: insn at %p is not monitor-enter (0x%02x)\n",
+            currentPc, *currentPc & 0xff);
+        return false;
+    }
+
+    /* get and check the register index */
+    unsigned int reg = *currentPc >> 8;
+    if (reg >= method->registersSize) {
+        LOGD("ExtrMon: invalid register %d (max %d)\n",
+            reg, method->registersSize);
+        return false;
+    }
+
+    /* get and check the object in that register */
+    u4* fp = (u4*) framePtr;
+    Object* obj = (Object*) fp[reg];
+    if (!dvmIsValidObject(obj)) {
+        LOGD("ExtrMon: invalid object %p at %p[%d]\n", obj, fp, reg);
+        return false;
+    }
+    *pLockObj = obj;
+
+    /*
+     * Try to determine the object's lock holder; it's okay if this fails.
+     *
+     * We're assuming the thread list lock is already held by this thread.
+     * If it's not, we may be living dangerously if we have to scan through
+     * the thread list to find a match.  (The VM will generally be in a
+     * suspended state when executing here, so this is a minor concern
+     * unless we're dumping while threads are running, in which case there's
+     * a good chance of stuff blowing up anyway.)
+     */
+    *pOwner = dvmGetObjectLockHolder(obj);
+
+    return true;
+}
 
 /*
  * Dump stack frames, starting from the specified frame and moving down.
@@ -1141,21 +1235,44 @@ static void dumpFrames(const DebugOutputTarget* target, void* framePtr,
             }
             free(className);
 
-            if (first &&
-                (thread->status == THREAD_WAIT ||
-                 thread->status == THREAD_TIMED_WAIT))
-            {
-                /* warning: wait status not stable, even in suspend */
-                Monitor* mon = thread->waitMonitor;
-                Object* obj = dvmGetMonitorObject(mon);
-                if (obj != NULL) {
-                    className = dvmDescriptorToDot(obj->clazz->descriptor);
-                    dvmPrintDebugMessage(target,
-                        "  - waiting on <%p> (a %s)\n", mon, className);
-                    free(className);
+            if (first) {
+                /*
+                 * Decorate WAIT and MONITOR threads with some detail on
+                 * the first frame.
+                 *
+                 * warning: wait status not stable, even in suspend
+                 */
+                if (thread->status == THREAD_WAIT ||
+                    thread->status == THREAD_TIMED_WAIT)
+                {
+                    Monitor* mon = thread->waitMonitor;
+                    Object* obj = dvmGetMonitorObject(mon);
+                    if (obj != NULL) {
+                        className = dvmDescriptorToDot(obj->clazz->descriptor);
+                        dvmPrintDebugMessage(target,
+                            "  - waiting on <%p> (a %s)\n", obj, className);
+                        free(className);
+                    }
+                } else if (thread->status == THREAD_MONITOR) {
+                    Object* obj;
+                    Thread* owner;
+                    if (extractMonitorEnterObject(thread, &obj, &owner)) {
+                        className = dvmDescriptorToDot(obj->clazz->descriptor);
+                        if (owner != NULL) {
+                            char* threadName = dvmGetThreadName(owner);
+                            dvmPrintDebugMessage(target,
+                                "  - waiting to lock <%p> (a %s) held by threadid=%d (%s)\n",
+                                obj, className, owner->threadId, threadName);
+                            free(threadName);
+                        } else {
+                            dvmPrintDebugMessage(target,
+                                "  - waiting to lock <%p> (a %s) held by ???\n",
+                                obj, className);
+                        }
+                        free(className);
+                    }
                 }
             }
-
         }
 
         /*

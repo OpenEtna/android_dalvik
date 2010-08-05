@@ -97,6 +97,9 @@ same time.
  */
 bool dvmDebuggerStartup(void)
 {
+    if (!dvmBreakpointStartup())
+        return false;
+
     gDvm.dbgRegistry = dvmHashTableCreate(1000, NULL);
     return (gDvm.dbgRegistry != NULL);
 }
@@ -108,6 +111,7 @@ void dvmDebuggerShutdown(void)
 {
     dvmHashTableFree(gDvm.dbgRegistry);
     gDvm.dbgRegistry = NULL;
+    dvmBreakpointShutdown();
 }
 
 
@@ -317,6 +321,20 @@ static Object* objectIdToObject(ObjectId id)
 }
 
 /*
+ * Register an object ID that might not have been registered previously.
+ *
+ * Normally this wouldn't happen -- the conversion to an ObjectId would
+ * have added the object to the registry -- but in some cases (e.g.
+ * throwing exceptions) we really want to do the registration late.
+ */
+void dvmDbgRegisterObjectId(ObjectId id)
+{
+    Object* obj = (Object*)(u4) id;
+    LOGV("+++ registering %p (%s)\n", obj, obj->clazz->descriptor);
+    registerObject(obj, kObjectId, true);
+}
+
+/*
  * Convert to/from a MethodId.
  *
  * These IDs are only guaranteed unique within a class, so they could be
@@ -400,6 +418,9 @@ void dvmDbgActive(void)
     LOGI("Debugger is active\n");
     dvmInitBreakpoints();
     gDvm.debuggerActive = true;
+#if defined(WITH_JIT)
+    dvmCompilerStateRefresh();
+#endif
 }
 
 /*
@@ -419,7 +440,7 @@ void dvmDbgDisconnected(void)
     dvmHashTableLock(gDvm.dbgRegistry);
     gDvm.debuggerConnected = false;
 
-    LOGI("Debugger has detached; object registry had %d entries\n",
+    LOGD("Debugger has detached; object registry had %d entries\n",
         dvmHashTableNumEntries(gDvm.dbgRegistry));
     //int i;
     //for (i = 0; i < gDvm.dbgRegistryNext; i++)
@@ -427,6 +448,9 @@ void dvmDbgDisconnected(void)
 
     dvmHashTableClear(gDvm.dbgRegistry);
     dvmHashTableUnlock(gDvm.dbgRegistry);
+#if defined(WITH_JIT)
+    dvmCompilerStateRefresh();
+#endif
 }
 
 /*
@@ -509,6 +533,15 @@ const char* dvmDbgGetClassDescriptor(RefTypeId id)
 
     clazz = refTypeIdToClassObject(id);
     return clazz->descriptor;
+}
+
+/*
+ * Convert a RefTypeId to an ObjectId.
+ */
+ObjectId dvmDbgGetClassObject(RefTypeId id)
+{
+    ClassObject* clazz = refTypeIdToClassObject(id);
+    return objectToObjectId((Object*) clazz);
 }
 
 /*
@@ -1114,6 +1147,19 @@ ObjectId dvmDbgCreateString(const char* str)
     strObj = dvmCreateStringFromCstr(str, ALLOC_DEFAULT);
     dvmReleaseTrackedAlloc((Object*) strObj, NULL);
     return objectToObjectId((Object*) strObj);
+}
+
+/*
+ * Allocate a new object of the specified type.
+ *
+ * Add it to the registry to prevent it from being GCed.
+ */
+ObjectId dvmDbgCreateObject(RefTypeId classId)
+{
+    ClassObject* clazz = refTypeIdToClassObject(classId);
+    Object* newObj = dvmAllocObject(clazz, ALLOC_DEFAULT);
+    dvmReleaseTrackedAlloc(newObj, NULL);
+    return objectToObjectId(newObj);
 }
 
 /*
@@ -2470,7 +2516,7 @@ void dvmDbgPostLocationEvent(const Method* method, int pcOffset,
 
     /*
      * Note we use "NoReg" so we don't keep track of references that are
-     * never actually sent to the debugger.  The "thisPtr" is used to
+     * never actually sent to the debugger.  The "thisPtr" is only used to
      * compare against registered events.
      */
 
@@ -2517,7 +2563,17 @@ void dvmDbgPostException(void* throwFp, int throwRelPc, void* catchFp,
     /* need this for InstanceOnly filters */
     Object* thisObj = getThisObject(throwFp);
 
-    dvmJdwpPostException(gDvm.jdwpState, &throwLoc, objectToObjectId(exception),
+    /*
+     * Hand the event to the JDWP exception handler.  Note we're using the
+     * "NoReg" objectID on the exception, which is not strictly correct --
+     * the exception object WILL be passed up to the debugger if the
+     * debugger is interested in the event.  We do this because the current
+     * implementation of the debugger object registry never throws anything
+     * away, and some people were experiencing a fatal build up of exception
+     * objects when dealing with certain libraries.
+     */
+    dvmJdwpPostException(gDvm.jdwpState, &throwLoc,
+        objectToObjectIdNoReg(exception),
         classObjectToRefTypeId(exception->clazz), &catchLoc,
         objectToObjectId(thisObj));
 }
@@ -2676,6 +2732,30 @@ JdwpError dvmDbgInvokeMethod(ObjectId threadId, ObjectId objectId,
     }
 
     /*
+     * We currently have a bug where we don't successfully resume the
+     * target thread if the suspend count is too deep.  We're expected to
+     * require one "resume" for each "suspend", but when asked to execute
+     * a method we have to resume fully and then re-suspend it back to the
+     * same level.  (The easiest way to cause this is to type "suspend"
+     * multiple times in jdb.)
+     *
+     * It's unclear what this means when the event specifies "resume all"
+     * and some threads are suspended more deeply than others.  This is
+     * a rare problem, so for now we just prevent it from hanging forever
+     * by rejecting the method invocation request.  Without this, we will
+     * be stuck waiting on a suspended thread.
+     */
+    if (targetThread->suspendCount > 1) {
+        LOGW("threadid=%d: suspend count on threadid=%d is %d, too deep "
+             "for method exec\n",
+            dvmThreadSelf()->threadId, targetThread->threadId,
+            targetThread->suspendCount);
+        err = ERR_THREAD_SUSPENDED;     /* probably not expected here */
+        dvmUnlockThreadList();
+        goto bail;
+    }
+
+    /*
      * TODO: ought to screen the various IDs, and verify that the argument
      * list is valid.
      */
@@ -2796,9 +2876,11 @@ void dvmDbgExecuteMethod(DebugInvokeReq* pReq)
 
     /*
      * Translate the method through the vtable, unless we're calling a
-     * static method or the debugger wants to suppress it.
+     * direct method or the debugger wants to suppress it.
      */
-    if ((pReq->options & INVOKE_NONVIRTUAL) != 0 || pReq->obj == NULL) {
+    if ((pReq->options & INVOKE_NONVIRTUAL) != 0 || pReq->obj == NULL ||
+        dvmIsDirectMethod(pReq->method))
+    {
         meth = pReq->method;
     } else {
         meth = dvmGetVirtualizedMethod(pReq->clazz, pReq->method);
@@ -2809,8 +2891,8 @@ void dvmDbgExecuteMethod(DebugInvokeReq* pReq)
 
     IF_LOGV() {
         char* desc = dexProtoCopyMethodDescriptor(&meth->prototype);
-        LOGV("JDWP invoking method %s.%s %s\n",
-            meth->clazz->descriptor, meth->name, desc);
+        LOGV("JDWP invoking method %p/%p %s.%s:%s\n",
+            pReq->method, meth, meth->clazz->descriptor, meth->name, desc);
         free(desc);
     }
 
@@ -2819,8 +2901,10 @@ void dvmDbgExecuteMethod(DebugInvokeReq* pReq)
     pReq->exceptObj = objectToObjectId(dvmGetException(self));
     pReq->resultTag = resultTagFromSignature(meth);
     if (pReq->exceptObj != 0) {
-        LOGD("  JDWP invocation returning with exceptObj=%p\n",
-            dvmGetException(self));
+        Object* exc = dvmGetException(self);
+        LOGD("  JDWP invocation returning with exceptObj=%p (%s)\n",
+            exc, exc->clazz->descriptor);
+        //dvmLogExceptionStackTrace();
         dvmClearException(self);
         /*
          * Nothing should try to use this, but it looks like something is.
@@ -2946,14 +3030,24 @@ void dvmDbgDdmDisconnected(void)
 /*
  * Send up a JDWP event packet with a DDM chunk in it.
  */
-void dvmDbgDdmSendChunk(int type, int len, const u1* buf)
+void dvmDbgDdmSendChunk(int type, size_t len, const u1* buf)
+{
+    assert(buf != NULL);
+    struct iovec vec[1] = { {(void*)buf, len} };
+    dvmDbgDdmSendChunkV(type, vec, 1);
+}
+
+/*
+ * Send up a JDWP event packet with a DDM chunk in it.  The chunk is
+ * concatenated from multiple source buffers.
+ */
+void dvmDbgDdmSendChunkV(int type, const struct iovec* iov, int iovcnt)
 {
     if (gDvm.jdwpState == NULL) {
-        LOGI("Debugger thread not active, ignoring DDM send (t=0x%08x l=%d)\n",
+        LOGV("Debugger thread not active, ignoring DDM send (t=0x%08x l=%d)\n",
             type, len);
         return;
     }
 
-    dvmJdwpDdmSendChunk(gDvm.jdwpState, type, len, buf);
+    dvmJdwpDdmSendChunkV(gDvm.jdwpState, type, iov, iovcnt);
 }
-

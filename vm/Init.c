@@ -114,12 +114,14 @@ static void dvmUsage(const char* progName)
     dvmFprintf(stderr, "  -Xjitop:hexopvalue[-endvalue]"
                        "[,hexopvalue[-endvalue]]*\n");
     dvmFprintf(stderr, "  -Xincludeselectedmethod\n");
-    dvmFprintf(stderr, "  -Xthreshold:decimalvalue\n");
-    dvmFprintf(stderr, "  -Xblocking\n");
-    dvmFprintf(stderr, "  -Xjitmethod:signture[,signature]* "
+    dvmFprintf(stderr, "  -Xjitthreshold:decimalvalue\n");
+    dvmFprintf(stderr, "  -Xjitblocking\n");
+    dvmFprintf(stderr, "  -Xjitmethod:signature[,signature]* "
                        "(eg Ljava/lang/String\\;replace)\n");
+    dvmFprintf(stderr, "  -Xjitcheckcg\n");
     dvmFprintf(stderr, "  -Xjitverbose\n");
     dvmFprintf(stderr, "  -Xjitprofile\n");
+    dvmFprintf(stderr, "  -Xjitdisableopt\n");
 #endif
     dvmFprintf(stderr, "\n");
     dvmFprintf(stderr, "Configured with:"
@@ -185,7 +187,10 @@ static void dvmUsage(const char* progName)
         " resolver_cache_disabled"
 #endif
 #if defined(WITH_JIT)
-        " with_jit"
+        " jit"
+#endif
+#if defined(WITH_SELF_VERIFICATION)
+        " self_verification"
 #endif
     );
 #ifdef DVM_SHOW_EXCEPTION
@@ -790,6 +795,8 @@ static int dvmProcessOptions(int argc, const char* const argv[],
             gDvm.verboseJni = true;
         } else if (strcmp(argv[i], "-verbose:gc") == 0) {
             gDvm.verboseGc = true;
+        } else if (strcmp(argv[i], "-verbose:shutdown") == 0) {
+            gDvm.verboseShutdown = true;
 
         } else if (strncmp(argv[i], "-enableassertions", 17) == 0) {
             enableAssertions(argv[i] + 17, true);
@@ -837,6 +844,9 @@ static int dvmProcessOptions(int argc, const char* const argv[],
             gDvm.noQuitHandler = true;
         } else if (strcmp(argv[i], "-Xzygote") == 0) {
             gDvm.zygote = true;
+#if defined(WITH_JIT)
+            gDvmJit.runningInAndroidFramework = true;
+#endif
         } else if (strncmp(argv[i], "-Xdexopt:", 9) == 0) {
             if (strcmp(argv[i] + 9, "none") == 0)
                 gDvm.dexOptMode = OPTIMIZE_MODE_NONE;
@@ -890,23 +900,38 @@ static int dvmProcessOptions(int argc, const char* const argv[],
                 /* disable JIT -- nothing to do here for now */
             }
 
+        } else if (strncmp(argv[i], "-Xlockprofthreshold:", 20) == 0) {
+            gDvm.lockProfThreshold = atoi(argv[i] + 20);
+
 #ifdef WITH_JIT
         } else if (strncmp(argv[i], "-Xjitop", 7) == 0) {
             processXjitop(argv[i]);
         } else if (strncmp(argv[i], "-Xjitmethod", 11) == 0) {
             processXjitmethod(argv[i]);
-        } else if (strncmp(argv[i], "-Xblocking", 10) == 0) {
+        } else if (strncmp(argv[i], "-Xjitblocking", 13) == 0) {
           gDvmJit.blockingMode = true;
-        } else if (strncmp(argv[i], "-Xthreshold:", 12) == 0) {
-          gDvmJit.threshold = atoi(argv[i] + 12);
+        } else if (strncmp(argv[i], "-Xjitthreshold:", 15) == 0) {
+          gDvmJit.threshold = atoi(argv[i] + 15);
         } else if (strncmp(argv[i], "-Xincludeselectedop", 19) == 0) {
           gDvmJit.includeSelectedOp = true;
         } else if (strncmp(argv[i], "-Xincludeselectedmethod", 23) == 0) {
           gDvmJit.includeSelectedMethod = true;
+        } else if (strncmp(argv[i], "-Xjitcheckcg", 12) == 0) {
+          gDvmJit.checkCallGraph = true;
+          /* Need to enable blocking mode due to stack crawling */
+          gDvmJit.blockingMode = true;
         } else if (strncmp(argv[i], "-Xjitverbose", 12) == 0) {
           gDvmJit.printMe = true;
         } else if (strncmp(argv[i], "-Xjitprofile", 12) == 0) {
           gDvmJit.profile = true;
+        } else if (strncmp(argv[i], "-Xjitdisableopt", 15) == 0) {
+          /* Disable selected optimizations */
+          if (argv[i][15] == ':') {
+              sscanf(argv[i] + 16, "%x", &gDvmJit.disableOpt);
+          /* Disable all optimizations */
+          } else {
+              gDvmJit.disableOpt = -1;
+          }
 #endif
 
         } else if (strncmp(argv[i], "-Xdeadlockpredict:", 18) == 0) {
@@ -943,7 +968,7 @@ static int dvmProcessOptions(int argc, const char* const argv[],
                 dvmFprintf(stderr, "Bad value for -Xgc");
                 return -1;
             }
-            LOGD("Precise GC configured %s\n", gDvm.preciseGc ? "ON" : "OFF");
+            LOGV("Precise GC configured %s\n", gDvm.preciseGc ? "ON" : "OFF");
 
         } else if (strcmp(argv[i], "-Xcheckdexsum") == 0) {
             gDvm.verifyDexChecksum = true;
@@ -1009,14 +1034,6 @@ static void setCommandLineDefaults()
      */
 #if defined(WITH_JIT)
     gDvm.executionMode = kExecutionModeJit;
-    /* 
-     * TODO - check system property and insert command-line options in 
-     *        frameworks/base/core/jni/AndroidRuntime.cpp
-     */
-    gDvmJit.blockingMode = false;
-    gDvmJit.jitTableSize = 512;
-    gDvmJit.jitTableMask = gDvmJit.jitTableSize - 1;
-    gDvmJit.threshold = 200;
 #else
     gDvm.executionMode = kExecutionModeInterpFast;
 #endif
@@ -1129,6 +1146,13 @@ int dvmStartup(int argc, const char* const argv[], bool ignoreUnrecognized,
     if (!gDvm.reduceSignals)
         blockSignals();
 
+    /* verify system page size */
+    if (sysconf(_SC_PAGESIZE) != SYSTEM_PAGE_SIZE) {
+        LOGE("ERROR: expected page size %d, got %d\n",
+            SYSTEM_PAGE_SIZE, (int) sysconf(_SC_PAGESIZE));
+        goto fail;
+    }
+
     /* mterp setup */
     LOGV("Using executionMode %d\n", gDvm.executionMode);
     dvmCheckAsmConstants();
@@ -1230,6 +1254,16 @@ int dvmStartup(int argc, const char* const argv[], bool ignoreUnrecognized,
      */
     if (!dvmPrepMainThread())
         goto fail;
+
+    /*
+     * Make sure we haven't accumulated any tracked references.  The main
+     * thread should be starting with a clean slate.
+     */
+    if (dvmReferenceTableEntries(&dvmThreadSelf()->internalLocalRefTable) != 0)
+    {
+        LOGW("Warning: tracked references remain post-initialization\n");
+        dvmDumpReferenceTable(&dvmThreadSelf()->internalLocalRefTable, "MAIN");
+    }
 
     /* general debugging setup */
     if (!dvmDebuggerStartup())
@@ -1362,8 +1396,10 @@ bool dvmInitAfterZygote(void)
         (int)(endJdwp-startJdwp), (int)(endJdwp-startHeap));
 
 #ifdef WITH_JIT
-    if (!dvmJitStartup())
-        return false;
+    if (gDvm.executionMode == kExecutionModeJit) {
+        if (!dvmCompilerStartup())
+            return false;
+    }
 #endif
 
     return true;
@@ -1552,8 +1588,10 @@ void dvmShutdown(void)
     dvmStdioConverterShutdown();
 
 #ifdef WITH_JIT
-    /* tell the compiler to shut down if it was started */
-    dvmJitShutdown();
+    if (gDvm.executionMode == kExecutionModeJit) {
+        /* shut down the compiler thread */
+        dvmCompilerShutdown();
+    }
 #endif
 
     /*
@@ -1563,7 +1601,8 @@ void dvmShutdown(void)
      */
     dvmSlayDaemons();
 
-    LOGD("VM cleaning up\n");
+    if (gDvm.verboseShutdown)
+        LOGD("VM cleaning up\n");
 
     dvmDebuggerShutdown();
     dvmReflectShutdown();

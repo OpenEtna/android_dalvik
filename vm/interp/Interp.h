@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 /*
  * Dalvik interpreter public definitions.
  */
@@ -34,12 +35,30 @@ void dvmInterpret(Thread* thread, const Method* method, JValue* pResult);
 void dvmThrowVerificationError(const Method* method, int kind, int ref);
 
 /*
- * Breakpoint optimization table.
+ * One-time initialization and shutdown.
+ */
+bool dvmBreakpointStartup(void);
+void dvmBreakpointShutdown(void);
+
+/*
+ * Breakpoint implementation.
  */
 void dvmInitBreakpoints();
-void dvmAddBreakAddr(Method* method, int instrOffset);
-void dvmClearBreakAddr(Method* method, int instrOffset);
+void dvmAddBreakAddr(Method* method, unsigned int instrOffset);
+void dvmClearBreakAddr(Method* method, unsigned int instrOffset);
 bool dvmAddSingleStep(Thread* thread, int size, int depth);
 void dvmClearSingleStep(Thread* thread);
+
+#ifdef WITH_DEBUGGER
+/*
+ * Recover the opcode that was replaced by a breakpoint.
+ */
+u1 dvmGetOriginalOpCode(const u2* addr);
+
+/*
+ * Flush any breakpoints associated with methods in "clazz".
+ */
+void dvmFlushBreakpoints(ClassObject* clazz);
+#endif
 
 #endif /*_DALVIK_INTERP_INTERP*/

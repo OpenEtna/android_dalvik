@@ -187,12 +187,23 @@ typedef enum PrimitiveType {
 #define CLASS_OFFSET_ALIGNMENT 4
 #define CLASS_HIGH_BIT ((unsigned int)1 << (CLASS_BITS_PER_WORD - 1))
 /*
- * Return a single bit, or zero if the encoding can't encode the offset.
+ * Given an offset, return the bit number which would encode that offset.
+ * Local use only.
+ */
+#define _CLASS_BIT_NUMBER_FROM_OFFSET(byteOffset) \
+    (((unsigned int)(byteOffset) - CLASS_SMALLEST_OFFSET) / \
+     CLASS_OFFSET_ALIGNMENT)
+/*
+ * Is the given offset too large to be encoded?
+ */
+#define CLASS_CAN_ENCODE_OFFSET(byteOffset) \
+    (_CLASS_BIT_NUMBER_FROM_OFFSET(byteOffset) < CLASS_BITS_PER_WORD)
+/*
+ * Return a single bit, encoding the offset.
+ * Undefined if the offset is too large, as defined above.
  */
 #define CLASS_BIT_FROM_OFFSET(byteOffset) \
-    (CLASS_HIGH_BIT >> \
-      (((unsigned int)(byteOffset) - CLASS_SMALLEST_OFFSET) / \
-       CLASS_OFFSET_ALIGNMENT))
+    (CLASS_HIGH_BIT >> _CLASS_BIT_NUMBER_FROM_OFFSET(byteOffset))
 /*
  * Return an offset, given a bit number as returned from CLZ.
  */
@@ -232,8 +243,11 @@ typedef struct Object {
     /* ptr to class object */
     ClassObject*    clazz;
 
-    /* thin lock or "fat" monitor */
-    Lock            lock;
+    /*
+     * A word containing either a "thin" lock or a "fat" monitor.  See
+     * the comments in Sync.c for a description of its layout.
+     */
+    u4              lock;
 } Object;
 
 /*
@@ -277,7 +291,7 @@ struct StringObject {
  *
  * We don't currently store the size of each element.  Usually it's implied
  * by the instruction.  If necessary, the width can be derived from
- * the first char of obj->clazz->name.
+ * the first char of obj->clazz->descriptor.
  */
 struct ArrayObject {
     Object          obj;                /* MUST be first item */
@@ -366,9 +380,6 @@ struct ClassObject {
     /* arrays only: class object for base element, for instanceof/checkcast
        (for String[][][], this will be String) */
     ClassObject*    elementClass;
-
-    /* class object representing an array of this class; set on first use */
-    ClassObject*    arrayClass;
 
     /* arrays only: number of dimensions, e.g. int[][] is 2 */
     int             arrayDim;
@@ -541,9 +552,6 @@ struct Method {
 
 #ifdef WITH_PROFILER
     bool            inProfile;
-#endif
-#ifdef WITH_DEBUGGER
-    short           debugBreakpointCount;
 #endif
 };
 

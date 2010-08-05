@@ -3,17 +3,18 @@
     /*
      * Execute a "native inline" instruction.
      *
-     * We need to call:
-     *  dvmPerformInlineOp4Std(arg0, arg1, arg2, arg3, &retval, ref)
+     * We need to call an InlineOp4Func:
+     *  bool (func)(u4 arg0, u4 arg1, u4 arg2, u4 arg3, JValue* pResult)
      *
-     * The first four args are in r0-r3, but the last two must be pushed
-     * onto the stack.
+     * The first four args are in r0-r3, pointer to return value storage
+     * is on the stack.  The function's return value is a flag that tells
+     * us if an exception was thrown.
      */
     /* [opt] execute-inline vAA, {vC, vD, vE, vF}, inline@BBBB */
     FETCH(r10, 1)                       @ r10<- BBBB
     add     r1, rGLUE, #offGlue_retval  @ r1<- &glue->retval
     EXPORT_PC()                         @ can throw
-    sub     sp, sp, #8                  @ make room for arg(s)
+    sub     sp, sp, #8                  @ make room for arg, +64 bit align
     mov     r0, rINST, lsr #12          @ r0<- B
     str     r1, [sp]                    @ push &glue->retval
     bl      .L${opcode}_continue        @ make call; will return after

@@ -17,7 +17,10 @@
 #ifndef _DALVIK_VM_COMPILER_UTILITY
 #define _DALVIK_VM_COMPILER_UTILITY
 
-#define ARENA_DEFAULT_SIZE 4096
+#include "Dalvik.h"
+
+/* Each arena page has some overhead, so take a few bytes off 8k */
+#define ARENA_DEFAULT_SIZE 8100
 
 /* Allocate the initial memory block for arena-based allocation */
 bool dvmCompilerHeapInit(void);
@@ -38,7 +41,18 @@ typedef struct GrowableList {
     void **elemList;
 } GrowableList;
 
+#define GET_ELEM_N(LIST, TYPE, N) (((TYPE*) LIST->elemList)[N])
+#define MIN(x,y) (((x) < (y)) ? (x) : (y))
+#define MAX(x,y) (((x) > (y)) ? (x) : (y))
+
+struct LIR;
+
 void dvmInitGrowableList(GrowableList *gList, size_t initLength);
 void dvmInsertGrowableList(GrowableList *gList, void *elem);
+BitVector* dvmCompilerAllocBitVector(int startBits, bool expandable);
+bool dvmCompilerSetBit(BitVector* pBits, int num);
+void dvmDebugBitVector(char *msg, const BitVector *bv, int length);
+void dvmDumpLIRInsn(struct LIR *lir, unsigned char *baseAddr);
+void dvmDumpResourceMask(struct LIR *lir, u8 mask, const char *prefix);
 
 #endif /* _DALVIK_COMPILER_UTILITY */

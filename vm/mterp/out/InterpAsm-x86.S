@@ -703,7 +703,7 @@ dvmAsmInstructionStart = .L_OP_NOP
     GET_GLUE(%ecx)
     EXPORT_PC()
     testl   %eax,%eax                   # null object?
-    je      common_errNullObject        # go if so
+    je      .LOP_MONITOR_EXIT_errNullObject   # go if so
     movl    offGlue_self(%ecx),%ecx     # ecx<- glue->self
     movl    %eax,OUT_ARG1(%esp)
     SPILL(rPC)
@@ -5797,8 +5797,8 @@ dvmAsmInstructionStart = .L_OP_NOP
 
 /* ------------------------------ */
     .balign 64
-.L_OP_UNUSED_EC: /* 0xec */
-/* File: x86/OP_UNUSED_EC.S */
+.L_OP_BREAKPOINT: /* 0xec */
+/* File: x86/OP_BREAKPOINT.S */
 /* File: x86/unused.S */
     jmp     common_abort
 
@@ -5857,12 +5857,18 @@ dvmAsmInstructionStart = .L_OP_NOP
 
 /* ------------------------------ */
     .balign 64
-.L_OP_UNUSED_EF: /* 0xef */
-/* File: x86/OP_UNUSED_EF.S */
-/* File: x86/unused.S */
-    jmp     common_abort
-
-
+.L_OP_EXECUTE_INLINE_RANGE: /* 0xef */
+    /* (stub) */
+    GET_GLUE(%ecx)
+    SAVE_PC_TO_GLUE(%ecx)            # only need to export these two
+    SAVE_FP_TO_GLUE(%ecx)            # only need to export these two
+    movl %ecx,OUT_ARG0(%esp)         # glue is first arg to function
+    call      dvmMterp_OP_EXECUTE_INLINE_RANGE     # do the real work
+    GET_GLUE(%ecx)
+    LOAD_PC_FROM_GLUE(%ecx)          # retrieve updated values
+    LOAD_FP_FROM_GLUE(%ecx)          # retrieve updated values
+    FETCH_INST()
+    GOTO_NEXT
 /* ------------------------------ */
     .balign 64
 .L_OP_INVOKE_DIRECT_EMPTY: /* 0xf0 */
@@ -6275,9 +6281,12 @@ dvmAsmSisterStart:
     UNSPILL(rPC)
     FETCH_INST_WORD(1)
     testl   %eax,%eax                   # success?
-    je      common_exceptionThrown      # no, exception pending
     ADVANCE_PC(1)
+    je      common_exceptionThrown      # no, exception pending
     GOTO_NEXT
+.LOP_MONITOR_EXIT_errNullObject:
+    ADVANCE_PC(1)                       # advance before throw
+    jmp     common_errNullObject
 
 /* continuation for OP_CHECK_CAST */
 
@@ -8727,11 +8736,12 @@ common_invokeMethodNoRange:
     ADVANCE_PC(3)
     GOTO_NEXT                           # jump to next instruction
 
-.LstackOverflow:
+.LstackOverflow:    # eax=methodToCall
+    movl        %eax, OUT_ARG1(%esp)    # push parameter methodToCall
     GET_GLUE(%eax)                      # %eax<- pMterpGlue
     movl        offGlue_self(%eax), %eax # %eax<- glue->self
     movl        %eax, OUT_ARG0(%esp)    # push parameter self
-    call        dvmHandleStackOverflow  # call: (Thread* self)
+    call        dvmHandleStackOverflow  # call: (Thread* self, Method* meth)
     UNSPILL(rPC)                        # return: void
     jmp         common_exceptionThrown  # handle exception
 

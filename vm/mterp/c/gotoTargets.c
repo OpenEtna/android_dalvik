@@ -532,6 +532,10 @@ GOTO_TARGET(returnFromMethod)
         if (dvmIsBreakFrame(fp)) {
             /* bail without popping the method frame from stack */
             LOGVV("+++ returned into break frame\n");
+#if defined(WITH_JIT)
+            /* Let the Jit know the return is terminating normally */
+            CHECK_JIT();
+#endif
             GOTO_bail();
         }
 
@@ -576,6 +580,10 @@ GOTO_TARGET(exceptionThrown)
          */
         PERIODIC_CHECKS(kInterpEntryThrow, 0);
 
+#if defined(WITH_JIT)
+        // Something threw during trace selection - abort the current trace
+        ABORT_JIT_TSELECT();
+#endif
         /*
          * We save off the exception and clear the exception status.  While
          * processing the exception we might need to load some Throwable
@@ -626,6 +634,9 @@ GOTO_TARGET(exceptionThrown)
          *
          * If we do find a catch block, we want to transfer execution to
          * that point.
+         *
+         * Note this can cause an exception while resolving classes in
+         * the "catch" blocks.
          */
         catchRelPc = dvmFindCatchBlock(self, pc - curMethod->insns,
                     exception, false, (void*)&fp);
@@ -640,9 +651,19 @@ GOTO_TARGET(exceptionThrown)
          * Note we want to do this *after* the call to dvmFindCatchBlock,
          * because that may need extra stack space to resolve exception
          * classes (e.g. through a class loader).
+         *
+         * It's possible for the stack overflow handling to cause an
+         * exception (specifically, class resolution in a "catch" block
+         * during the call above), so we could see the thread's overflow
+         * flag raised but actually be running in a "nested" interpreter
+         * frame.  We don't allow doubled-up StackOverflowErrors, so
+         * we can check for this by just looking at the exception type
+         * in the cleanup function.  Also, we won't unroll past the SOE
+         * point because the more-recent exception will hit a break frame
+         * as it unrolls to here.
          */
         if (self->stackOverflowed)
-            dvmCleanupStackOverflow(self);
+            dvmCleanupStackOverflow(self, exception);
 
         if (catchRelPc < 0) {
             /* falling through to JNI code or off the bottom of the stack */
@@ -807,10 +828,11 @@ GOTO_TARGET(invokeMethod, bool methodCallRange, const Method* _methodToCall,
             bottom = (u1*) newSaveArea - methodToCall->outsSize * sizeof(u4);
             if (bottom < self->interpStackEnd) {
                 /* stack overflow */
-                LOGV("Stack overflow on method call (start=%p end=%p newBot=%p size=%d '%s')\n",
+                LOGV("Stack overflow on method call (start=%p end=%p newBot=%p(%d) size=%d '%s')\n",
                     self->interpStackStart, self->interpStackEnd, bottom,
-                    self->interpStackSize, methodToCall->name);
-                dvmHandleStackOverflow(self);
+                    (u1*) fp - bottom, self->interpStackSize,
+                    methodToCall->name);
+                dvmHandleStackOverflow(self, methodToCall);
                 assert(dvmCheckException(self));
                 GOTO_exceptionThrown();
             }
@@ -884,6 +906,11 @@ GOTO_TARGET(invokeMethod, bool methodCallRange, const Method* _methodToCall,
 
             ILOGD("> native <-- %s.%s %s", methodToCall->clazz->descriptor,
                 methodToCall->name, methodToCall->shorty);
+
+#if defined(WITH_JIT)
+            /* Allow the Jit to end any pending trace building */
+            CHECK_JIT();
+#endif
 
             /*
              * Jump through native call bridge.  Because we leave no

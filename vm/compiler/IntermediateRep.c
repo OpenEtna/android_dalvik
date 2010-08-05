@@ -29,7 +29,7 @@ BasicBlock *dvmCompilerNewBB(BBType blockType)
 void dvmCompilerAppendMIR(BasicBlock *bb, MIR *mir)
 {
     if (bb->firstMIRInsn == NULL) {
-        assert(bb->firstMIRInsn == NULL);
+        assert(bb->lastMIRInsn == NULL);
         bb->lastMIRInsn = bb->firstMIRInsn = mir;
         mir->prev = mir->next = NULL;
     } else {
@@ -37,6 +37,21 @@ void dvmCompilerAppendMIR(BasicBlock *bb, MIR *mir)
         mir->prev = bb->lastMIRInsn;
         mir->next = NULL;
         bb->lastMIRInsn = mir;
+    }
+}
+
+/* Insert an MIR instruction to the head of a basic block */
+void dvmCompilerPrependMIR(BasicBlock *bb, MIR *mir)
+{
+    if (bb->firstMIRInsn == NULL) {
+        assert(bb->lastMIRInsn == NULL);
+        bb->lastMIRInsn = bb->firstMIRInsn = mir;
+        mir->prev = mir->next = NULL;
+    } else {
+        bb->firstMIRInsn->prev = mir;
+        mir->next = bb->firstMIRInsn;
+        mir->prev = NULL;
+        bb->firstMIRInsn = mir;
     }
 }
 
@@ -66,12 +81,25 @@ void dvmCompilerAppendLIR(CompilationUnit *cUnit, LIR *lir)
  */
 void dvmCompilerInsertLIRBefore(LIR *currentLIR, LIR *newLIR)
 {
-    if (currentLIR->prev == NULL)
-        dvmAbort();
+    assert(currentLIR->prev != NULL);
     LIR *prevLIR = currentLIR->prev;
 
     prevLIR->next = newLIR;
     newLIR->prev = prevLIR;
     newLIR->next = currentLIR;
     currentLIR->prev = newLIR;
+}
+
+/*
+ * Insert an LIR instruction after the current instruction, which cannot be the
+ * first instruction.
+ *
+ * currentLIR -> newLIR -> oldNext
+ */
+void dvmCompilerInsertLIRAfter(LIR *currentLIR, LIR *newLIR)
+{
+    newLIR->prev = currentLIR;
+    newLIR->next = currentLIR->next;
+    currentLIR->next = newLIR;
+    newLIR->next->prev = newLIR;
 }

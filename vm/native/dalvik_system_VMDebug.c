@@ -20,16 +20,103 @@
 #include "Dalvik.h"
 #include "native/InternalNativePriv.h"
 
+#include <errno.h>
+
+
+/*
+ * Convert an array of char* into a String[].
+ *
+ * Returns NULL on failure, with an exception raised.
+ */
+static ArrayObject* convertStringArray(char** strings, size_t count)
+{
+    /*
+     * Allocate an array to hold the String objects.
+     */
+    ClassObject* stringArrayClass =
+        dvmFindArrayClass("[Ljava/lang/String;", NULL);
+    if (stringArrayClass == NULL) {
+        /* shouldn't happen */
+        LOGE("Unable to find [Ljava/lang/String;\n");
+        dvmAbort();
+    }
+
+    ArrayObject* stringArray =
+        dvmAllocArrayByClass(stringArrayClass, count, ALLOC_DEFAULT);
+    if (stringArray == NULL) {
+        /* probably OOM */
+        LOGD("Failed allocating array of %d strings\n", count);
+        return NULL;
+    }
+
+    Thread* self = dvmThreadSelf();
+
+    /*
+     * Create the individual String objects and add them to the array.
+     */
+    StringObject** contents = (StringObject**) stringArray->contents;
+    size_t i;
+    for (i = 0; i < count; i++) {
+        contents[i] = dvmCreateStringFromCstr(strings[i], ALLOC_DEFAULT);
+        if (contents[i] == NULL) {
+            /* probably OOM; drop out now */
+            assert(dvmCheckException(dvmThreadSelf()));
+            dvmReleaseTrackedAlloc((Object*)stringArray, self);
+            return NULL;
+        }
+
+        /* stored in tracked array, okay to release */
+        dvmReleaseTrackedAlloc((Object*)contents[i], self);
+    }
+
+    dvmReleaseTrackedAlloc((Object*)stringArray, self);
+    return stringArray;
+}
+
+/*
+ * static String[] getVmFeatureList()
+ *
+ * Return a set of strings describing available VM features (this is chiefly
+ * of interest to DDMS).  Some features may be controlled by compile-time
+ * or command-line flags.
+ */
+static void Dalvik_dalvik_system_VMDebug_getVmFeatureList(const u4* args,
+    JValue* pResult)
+{
+    static const int MAX_FEATURE_COUNT = 10;
+    char* features[MAX_FEATURE_COUNT];
+    int idx = 0;
+
+#ifdef WITH_PROFILER
+    /* VM responds to DDMS method profiling requests */
+    features[idx++] = "method-trace-profiling";
+    features[idx++] = "method-trace-profiling-streaming";
+#endif
+#ifdef WITH_HPROF
+    /* VM responds to DDMS heap dump requests */
+    features[idx++] = "hprof-heap-dump";
+    features[idx++] = "hprof-heap-dump-streaming";
+#endif
+
+    assert(idx <= MAX_FEATURE_COUNT);
+
+    LOGV("+++ sending up %d features\n", idx);
+    ArrayObject* arrayObj = convertStringArray(features, idx);
+    RETURN_PTR(arrayObj);       /* will be null on OOM */
+}
+
 
 #ifdef WITH_PROFILER
 /* These must match the values in dalvik.system.VMDebug.
  */
 enum {
-    KIND_ALLOCATED_OBJECTS = 1<<0,
-    KIND_ALLOCATED_BYTES   = 1<<1,
-    KIND_FREED_OBJECTS     = 1<<2,
-    KIND_FREED_BYTES       = 1<<3,
-    KIND_GC_INVOCATIONS    = 1<<4,
+    KIND_ALLOCATED_OBJECTS      = 1<<0,
+    KIND_ALLOCATED_BYTES        = 1<<1,
+    KIND_FREED_OBJECTS          = 1<<2,
+    KIND_FREED_BYTES            = 1<<3,
+    KIND_GC_INVOCATIONS         = 1<<4,
+    KIND_CLASS_INIT_COUNT       = 1<<5,
+    KIND_CLASS_INIT_TIME        = 1<<6,
 #if PROFILE_EXTERNAL_ALLOCATIONS
     KIND_EXT_ALLOCATED_OBJECTS = 1<<12,
     KIND_EXT_ALLOCATED_BYTES   = 1<<13,
@@ -42,6 +129,8 @@ enum {
     KIND_GLOBAL_FREED_OBJECTS       = KIND_FREED_OBJECTS,
     KIND_GLOBAL_FREED_BYTES         = KIND_FREED_BYTES,
     KIND_GLOBAL_GC_INVOCATIONS      = KIND_GC_INVOCATIONS,
+    KIND_GLOBAL_CLASS_INIT_COUNT    = KIND_CLASS_INIT_COUNT,
+    KIND_GLOBAL_CLASS_INIT_TIME     = KIND_CLASS_INIT_TIME,
 #if PROFILE_EXTERNAL_ALLOCATIONS
     KIND_GLOBAL_EXT_ALLOCATED_OBJECTS = KIND_EXT_ALLOCATED_OBJECTS,
     KIND_GLOBAL_EXT_ALLOCATED_BYTES = KIND_EXT_ALLOCATED_BYTES,
@@ -86,6 +175,12 @@ static void clearAllocProfStateFields(AllocProfState *allocProf,
     }
     if (kinds & KIND_GC_INVOCATIONS) {
         allocProf->gcCount = 0;
+    }
+    if (kinds & KIND_CLASS_INIT_COUNT) {
+        allocProf->classInitCount = 0;
+    }
+    if (kinds & KIND_CLASS_INIT_TIME) {
+        allocProf->classInitTime = 0;
     }
 #if PROFILE_EXTERNAL_ALLOCATIONS
     if (kinds & KIND_EXT_ALLOCATED_OBJECTS) {
@@ -171,6 +266,13 @@ static void Dalvik_dalvik_system_VMDebug_getAllocCount(const u4* args,
     case KIND_GC_INVOCATIONS:
         pResult->i = allocProf->gcCount;
         break;
+    case KIND_CLASS_INIT_COUNT:
+        pResult->i = allocProf->classInitCount;
+        break;
+    case KIND_CLASS_INIT_TIME:
+        /* convert nsec to usec, reduce to 32 bits */
+        pResult->i = (int) (allocProf->classInitTime / 1000);
+        break;
 #if PROFILE_EXTERNAL_ALLOCATIONS
     case KIND_EXT_ALLOCATED_OBJECTS:
         pResult->i = allocProf->externalAllocCount;
@@ -209,12 +311,16 @@ static void Dalvik_dalvik_system_VMDebug_resetAllocCount(const u4* args,
 }
 
 /*
- * static void startMethodTracing(String traceFileName, java.io.FileDescriptor,
- *     int bufferSize, int flags)
+ * static void startMethodTracingNative(String traceFileName,
+ *     FileDescriptor fd, int bufferSize, int flags)
  *
  * Start method trace profiling.
+ *
+ * If both "traceFileName" and "fd" are null, the result will be sent
+ * directly to DDMS.  (The non-DDMS versions of the calls are expected
+ * to enforce non-NULL filenames.)
  */
-static void Dalvik_dalvik_system_VMDebug_startMethodTracing(const u4* args,
+static void Dalvik_dalvik_system_VMDebug_startMethodTracingNative(const u4* args,
     JValue* pResult)
 {
 #ifdef WITH_PROFILER
@@ -222,32 +328,40 @@ static void Dalvik_dalvik_system_VMDebug_startMethodTracing(const u4* args,
     DataObject* traceFd = (DataObject*) args[1];
     int bufferSize = args[2];
     int flags = args[3];
-    char* traceFileName;
 
     if (bufferSize == 0) {
         // Default to 8MB per the documentation.
         bufferSize = 8 * 1024 * 1024;
     }
 
-    if (traceFileStr == NULL || bufferSize < 1024) {
+    if (bufferSize < 1024) {
         dvmThrowException("Ljava/lang/IllegalArgumentException;", NULL);
         RETURN_VOID();
     }
 
-    traceFileName = dvmCreateCstrFromString(traceFileStr);
+    char* traceFileName = NULL;
+    if (traceFileStr != NULL)
+        traceFileName = dvmCreateCstrFromString(traceFileStr);
 
     int fd = -1;
     if (traceFd != NULL) {
-        InstField* field = dvmFindInstanceField(traceFd->obj.clazz, "descriptor", "I");
+        InstField* field =
+            dvmFindInstanceField(traceFd->obj.clazz, "descriptor", "I");
         if (field == NULL) {
             dvmThrowException("Ljava/lang/NoSuchFieldException;",
                 "No FileDescriptor.descriptor field");
             RETURN_VOID();
         }
         fd = dup(dvmGetFieldInt(&traceFd->obj, field->byteOffset));
+        if (fd < 0) {
+            dvmThrowExceptionFmt("Ljava/lang/RuntimeException;",
+                "dup() failed: %s", strerror(errno));
+            RETURN_VOID();
+        }
     }
     
-    dvmMethodTraceStart(traceFileName, fd, bufferSize, flags);
+    dvmMethodTraceStart(traceFileName != NULL ? traceFileName : "[DDMS]",
+        fd, bufferSize, flags, (traceFileName == NULL && fd == -1));
     free(traceFileName);
 #else
     // throw exception?
@@ -570,8 +684,34 @@ static void Dalvik_dalvik_system_VMDebug_dumpHprofData(const u4* args,
         RETURN_VOID();
     }
 
-    result = hprofDumpHeap(fileName);
+    result = hprofDumpHeap(fileName, false);
     free(fileName);
+
+    if (result != 0) {
+        /* ideally we'd throw something more specific based on actual failure */
+        dvmThrowException("Ljava/lang/RuntimeException;",
+            "Failure during heap dump -- check log output for details");
+        RETURN_VOID();
+    }
+#else
+    dvmThrowException("Ljava/lang/UnsupportedOperationException;", NULL);
+#endif
+
+    RETURN_VOID();
+}
+
+/*
+ * static void dumpHprofDataDdms()
+ *
+ * Cause "hprof" data to be computed and sent directly to DDMS.
+ */
+static void Dalvik_dalvik_system_VMDebug_dumpHprofDataDdms(const u4* args,
+    JValue* pResult)
+{
+#ifdef WITH_HPROF
+    int result;
+
+    result = hprofDumpHeap("[DDMS]", true);
 
     if (result != 0) {
         /* ideally we'd throw something more specific based on actual failure */
@@ -699,6 +839,23 @@ bail:
 }
 
 /*
+ * static void dumpReferenceTables()
+ */
+static void Dalvik_dalvik_system_VMDebug_dumpReferenceTables(const u4* args,
+    JValue* pResult)
+{
+    UNUSED_PARAMETER(args);
+    UNUSED_PARAMETER(pResult);
+
+    LOGI("--- reference table dump ---\n");
+    dvmDumpJniReferenceTables();
+    // could dump thread's internalLocalRefTable, probably not useful
+    // ditto for thread's jniMonitorRefTable
+    LOGI("---\n");
+    RETURN_VOID();
+}
+
+/*
  * static void crash()
  *
  * Dump the current thread's interpreted stack and abort the VM.  Useful
@@ -718,7 +875,26 @@ static void Dalvik_dalvik_system_VMDebug_crash(const u4* args,
     dvmAbort();
 }
 
+/*
+ * static void infopoint(int id)
+ *
+ * Provide a hook for gdb to hang to so that the VM can be stopped when
+ * user-tagged source locations are being executed.
+ */
+static void Dalvik_dalvik_system_VMDebug_infopoint(const u4* args,
+    JValue* pResult)
+{
+    gDvm.nativeDebuggerActive = true;
+
+    LOGD("VMDebug infopoint %d hit", args[0]);
+
+    gDvm.nativeDebuggerActive = false;
+    RETURN_VOID();
+}
+
 const DalvikNativeMethod dvm_dalvik_system_VMDebug[] = {
+    { "getVmFeatureList",           "()[Ljava/lang/String;",
+        Dalvik_dalvik_system_VMDebug_getVmFeatureList },
     { "getAllocCount",              "(I)I",
         Dalvik_dalvik_system_VMDebug_getAllocCount },
     { "resetAllocCount",            "(I)V",
@@ -727,8 +903,8 @@ const DalvikNativeMethod dvm_dalvik_system_VMDebug[] = {
         Dalvik_dalvik_system_VMDebug_startAllocCounting },
     { "stopAllocCounting",          "()V",
         Dalvik_dalvik_system_VMDebug_stopAllocCounting },
-    { "startMethodTracing",         "(Ljava/lang/String;Ljava/io/FileDescriptor;II)V",
-        Dalvik_dalvik_system_VMDebug_startMethodTracing },
+    { "startMethodTracingNative",   "(Ljava/lang/String;Ljava/io/FileDescriptor;II)V",
+        Dalvik_dalvik_system_VMDebug_startMethodTracingNative },
     { "isMethodTracingActive",      "()Z",
         Dalvik_dalvik_system_VMDebug_isMethodTracingActive },
     { "stopMethodTracing",          "()V",
@@ -763,10 +939,15 @@ const DalvikNativeMethod dvm_dalvik_system_VMDebug[] = {
         Dalvik_dalvik_system_VMDebug_threadCpuTimeNanos },
     { "dumpHprofData",              "(Ljava/lang/String;)V",
         Dalvik_dalvik_system_VMDebug_dumpHprofData },
+    { "dumpHprofDataDdms",          "()V",
+        Dalvik_dalvik_system_VMDebug_dumpHprofDataDdms },
     { "cacheRegisterMap",           "(Ljava/lang/String;)Z",
         Dalvik_dalvik_system_VMDebug_cacheRegisterMap },
+    { "dumpReferenceTables",        "()V",
+        Dalvik_dalvik_system_VMDebug_dumpReferenceTables },
     { "crash",                      "()V",
         Dalvik_dalvik_system_VMDebug_crash },
+    { "infopoint",                 "(I)V",
+        Dalvik_dalvik_system_VMDebug_infopoint },
     { NULL, NULL, NULL },
 };
-

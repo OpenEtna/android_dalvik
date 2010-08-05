@@ -10,7 +10,9 @@
     @ Prep for the native call
     @ r1 = newFP, r0 = methodToCall
     ldr     r3, [rGLUE, #offGlue_self]      @ r3<- glue->self
+    mov     r2, #0
     ldr     r9, [r3, #offThread_jniLocal_topCookie] @ r9<- thread->localRef->...
+    str     r2, [r3, #offThread_inJitCodeCache] @ not in jit code cache
     str     r1, [r3, #offThread_curFrame]   @ self->curFrame = newFp
     str     r9, [r1, #(offStackSaveArea_localRefCookie - sizeofStackSaveArea)]
                                         @ newFp->localRefCookie=top
@@ -23,33 +25,71 @@
 
     LDR_PC_LR "[r2, #offMethod_nativeFunc]"
 
+    @ Refresh Jit's on/off status
+    ldr     r3, [rGLUE, #offGlue_ppJitProfTable]
+
     @ native return; r9=self, r10=newSaveArea
     @ equivalent to dvmPopJniLocals
     ldr     r2, [r10, #offStackSaveArea_returnAddr] @ r2 = chaining cell ret
     ldr     r0, [r10, #offStackSaveArea_localRefCookie] @ r0<- saved->top
     ldr     r1, [r9, #offThread_exception] @ check for exception
+    ldr     r3, [r3]    @ r1 <- pointer to Jit profile table
     str     rFP, [r9, #offThread_curFrame]  @ self->curFrame = fp
     cmp     r1, #0                      @ null?
     str     r0, [r9, #offThread_jniLocal_topCookie] @ new top <- old top
-    bne     .LhandleException             @ no, handle exception
-    bx      r2
+    ldr     r0, [r10, #offStackSaveArea_savedPc] @ reload rPC
+    str     r3, [rGLUE, #offGlue_pJitProfTable]  @ cache current JitProfTable
 
-/* NOTE - this path can be exercised if the JIT threshold is set to 5 */
+    @ r0 = dalvikCallsitePC
+    bne     .LhandleException           @ no, handle exception
+
+    str     r2, [r9, #offThread_inJitCodeCache] @ set the new mode
+    cmp     r2, #0                      @ return chaining cell still exists?
+    bxne    r2                          @ yes - go ahead
+
+    @ continue executing the next instruction through the interpreter
+    ldr     r1, .LdvmJitToInterpTraceSelectNoChain @ defined in footer.S
+    add     rPC, r0, #6                 @ reconstruct new rPC (advance 6 bytes)
+#if defined(JIT_STATS)
+    mov     r0, #kCallsiteInterpreted
+#endif
+    mov     pc, r1
+
+/*
+ * On entry:
+ * r0  Faulting Dalvik PC
+ */
 .LhandleException:
-    ldr     r0, .LdvmMterpCommonExceptionThrown @ PIC way of getting &func
+#if defined(WITH_SELF_VERIFICATION)
+    ldr     pc, .LdeadFood @ should not see this under self-verification mode
+.LdeadFood:
+    .word   0xdeadf00d
+#endif
+    ldr     r3, [rGLUE, #offGlue_self]  @ r3<- glue->self
+    mov     r2, #0
+    str     r2, [r3, #offThread_inJitCodeCache] @ in interpreter land
+    ldr     r1, .LdvmMterpCommonExceptionThrown @ PIC way of getting &func
     ldr     rIBASE, .LdvmAsmInstructionStart    @ same as above
-    ldr     rPC, [r10, #offStackSaveArea_savedPc] @ reload rPC
-    mov     pc, r0                  @ branch to dvmMterpCommonExceptionThrown
+    mov     rPC, r0                 @ reload the faulting Dalvik address
+    mov     pc, r1                  @ branch to dvmMterpCommonExceptionThrown
 
     .align  2
 .LdvmAsmInstructionStart:
     .word   dvmAsmInstructionStart
+.LdvmJitToInterpTraceSelectNoChain:
+    .word   dvmJitToInterpTraceSelectNoChain
 .LdvmJitToInterpNoChain:
     .word   dvmJitToInterpNoChain
 .LdvmMterpStdBail:
     .word   dvmMterpStdBail
 .LdvmMterpCommonExceptionThrown:
     .word   dvmMterpCommonExceptionThrown
+.LdvmLockObject:
+    .word   dvmLockObject
+#if defined(WITH_SELF_VERIFICATION)
+.LdvmSelfVerificationMemOpDecode:
+    .word   dvmSelfVerificationMemOpDecode
+#endif
 .L__aeabi_cdcmple:
     .word   __aeabi_cdcmple
 .L__aeabi_cfcmple:

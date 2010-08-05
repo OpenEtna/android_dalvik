@@ -60,17 +60,20 @@ dvmMterpStdRun:
 
     /* set up "named" registers, figure out entry point */
     mov     rGLUE, r0                   @ set rGLUE
-    ldrb    r1, [r0, #offGlue_entryPoint]   @ InterpEntry enum is char
+    ldr     r1, [r0, #offGlue_entryPoint]   @ enum is 4 bytes in aapcs-EABI
     LOAD_PC_FP_FROM_GLUE()              @ load rPC and rFP from "glue"
     adr     rIBASE, dvmAsmInstructionStart  @ set rIBASE
     cmp     r1, #kInterpEntryInstr      @ usual case?
     bne     .Lnot_instr                 @ no, handle it
 
 #if defined(WITH_JIT)
-.Lno_singleStep:
+.LentryInstr:
+    ldr    r10, [rGLUE, #offGlue_self]  @ callee saved r10 <- glue->self
     /* Entry is always a possible trace start */
     GET_JIT_PROF_TABLE(r0)
     FETCH_INST()
+    mov    r1, #0                       @ prepare the value for the new state
+    str    r1, [r10, #offThread_inJitCodeCache] @ back to the interp land
     cmp    r0,#0
     bne    common_updateProfile
     GET_INST_OPCODE(ip)
@@ -92,18 +95,21 @@ dvmMterpStdRun:
 
 #if defined(WITH_JIT)
 .Lnot_throw:
-    ldr     r0,[rGLUE, #offGlue_jitResume]
-    ldr     r2,[rGLUE, #offGlue_jitResumePC]
+    ldr     r10,[rGLUE, #offGlue_jitResumeNPC]
+    ldr     r2,[rGLUE, #offGlue_jitResumeDPC]
     cmp     r1, #kInterpEntryResume     @ resuming after Jit single-step?
     bne     .Lbad_arg
     cmp     rPC,r2
-    bne     .Lno_singleStep             @ must have branched, don't resume
+    bne     .LentryInstr                @ must have branched, don't resume
+#if defined(WITH_SELF_VERIFICATION)
+    @ glue->entryPoint will be set in dvmSelfVerificationSaveState
+    b       jitSVShadowRunStart         @ re-enter the translation after the
+                                        @ single-stepped instruction
+    @noreturn
+#endif
     mov     r1, #kInterpEntryInstr
-    strb    r1, [rGLUE, #offGlue_entryPoint]
-    ldr     rINST, .LdvmCompilerTemplate
-    bx      r0                          @ re-enter the translation
-.LdvmCompilerTemplate:
-    .word   dvmCompilerTemplateStart
+    str     r1, [rGLUE, #offGlue_entryPoint]
+    bx      r10                         @ re-enter the translation
 #endif
 
 .Lbad_arg:

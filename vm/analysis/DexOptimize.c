@@ -54,6 +54,7 @@ static bool writeAuxData(int fd, const DexClassLookup* pClassLookup,\
     const IndexMapSet* pIndexMapSet, const RegisterMapBuilder* pRegMapBuilder);
 static void logFailedWrite(size_t expected, ssize_t actual, const char* msg,
     int err);
+static bool computeFileChecksum(int fd, off_t start, size_t length, u4* pSum);
 
 static bool rewriteDex(u1* addr, int len, bool doVerify, bool doOpt,\
     u4* pHeaderFlags, DexClassLookup** ppClassLookup);
@@ -64,8 +65,10 @@ static void optimizeClass(ClassObject* clazz, const InlineSub* inlineSubs);
 static bool optimizeMethod(Method* method, const InlineSub* inlineSubs);
 static void rewriteInstField(Method* method, u2* insns, OpCode newOpc);
 static bool rewriteVirtualInvoke(Method* method, u2* insns, OpCode newOpc);
-static bool rewriteDirectInvoke(Method* method, u2* insns);
+static bool rewriteEmptyDirectInvoke(Method* method, u2* insns);
 static bool rewriteExecuteInline(Method* method, u2* insns,
+    MethodType methodType, const InlineSub* inlineSubs);
+static bool rewriteExecuteInlineRange(Method* method, u2* insns,
     MethodType methodType, const InlineSub* inlineSubs);
 
 
@@ -643,6 +646,7 @@ bool dvmContinueOptimization(int fd, off_t dexOffset, long dexLength,
     /* get start offset, and adjust deps start for 64-bit alignment */
     off_t depsOffset, auxOffset, endOffset, adjOffset;
     int depsLength, auxLength;
+    u4 optChecksum;
 
     depsOffset = lseek(fd, 0, SEEK_END);
     if (depsOffset < 0) {
@@ -688,6 +692,13 @@ bool dvmContinueOptimization(int fd, off_t dexOffset, long dexLength,
     endOffset = lseek(fd, 0, SEEK_END);
     auxLength = endOffset - auxOffset;
 
+    /* compute checksum from start of deps to end of aux area */
+    if (!computeFileChecksum(fd, depsOffset,
+            (auxOffset+auxLength) - depsOffset, &optChecksum))
+    {
+        goto bail;
+    }
+
     /*
      * Output the "opt" header with all values filled in and a correct
      * magic number.
@@ -704,6 +715,7 @@ bool dvmContinueOptimization(int fd, off_t dexOffset, long dexLength,
     optHdr.auxLength = (u4) auxLength;
 
     optHdr.flags = headerFlags;
+    optHdr.checksum = optChecksum;
 
     ssize_t actual;
     lseek(fd, 0, SEEK_SET);
@@ -1158,6 +1170,45 @@ static void logFailedWrite(size_t expected, ssize_t actual, const char* msg,
         msg, (int)actual, (int)expected, strerror(err));
 }
 
+/*
+ * Compute a checksum on a piece of an open file.
+ *
+ * File will be positioned at end of checksummed area.
+ *
+ * Returns "true" on success.
+ */
+static bool computeFileChecksum(int fd, off_t start, size_t length, u4* pSum)
+{
+    unsigned char readBuf[8192];
+    ssize_t actual;
+    uLong adler;
+
+    if (lseek(fd, start, SEEK_SET) != start) {
+        LOGE("Unable to seek to start of checksum area (%ld): %s\n",
+            (long) start, strerror(errno));
+        return false;
+    }
+
+    adler = adler32(0L, Z_NULL, 0);
+
+    while (length != 0) {
+        size_t wanted = (length < sizeof(readBuf)) ? length : sizeof(readBuf);
+        actual = read(fd, readBuf, wanted);
+        if (actual <= 0) {
+            LOGE("Read failed (%d) while computing checksum (len=%zu): %s\n",
+                (int) actual, length, strerror(errno));
+            return false;
+        }
+
+        adler = adler32(adler, readBuf, actual);
+
+        length -= actual;
+    }
+
+    *pSum = adler;
+    return true;
+}
+
 
 /*
  * ===========================================================================
@@ -1565,8 +1616,15 @@ static bool optimizeMethod(Method* method, const InlineSub* inlineSubs)
             }
             break;
         case OP_INVOKE_VIRTUAL_RANGE:
-            if (!rewriteVirtualInvoke(method, insns, OP_INVOKE_VIRTUAL_QUICK_RANGE))
-                return false;
+            if (!rewriteExecuteInlineRange(method, insns, METHOD_VIRTUAL,
+                    inlineSubs))
+            {
+                if (!rewriteVirtualInvoke(method, insns,
+                        OP_INVOKE_VIRTUAL_QUICK_RANGE))
+                {
+                    return false;
+                }
+            }
             break;
         case OP_INVOKE_SUPER:
             if (!rewriteVirtualInvoke(method, insns, OP_INVOKE_SUPER_QUICK))
@@ -1580,12 +1638,19 @@ static bool optimizeMethod(Method* method, const InlineSub* inlineSubs)
         case OP_INVOKE_DIRECT:
             if (!rewriteExecuteInline(method, insns, METHOD_DIRECT, inlineSubs))
             {
-                if (!rewriteDirectInvoke(method, insns))
+                if (!rewriteEmptyDirectInvoke(method, insns))
                     return false;
             }
             break;
+        case OP_INVOKE_DIRECT_RANGE:
+            rewriteExecuteInlineRange(method, insns, METHOD_DIRECT, inlineSubs);
+            break;
+
         case OP_INVOKE_STATIC:
             rewriteExecuteInline(method, insns, METHOD_STATIC, inlineSubs);
+            break;
+        case OP_INVOKE_STATIC_RANGE:
+            rewriteExecuteInlineRange(method, insns, METHOD_STATIC, inlineSubs);
             break;
 
         default:
@@ -2107,7 +2172,7 @@ static bool rewriteVirtualInvoke(Method* method, u2* insns, OpCode newOpc)
  * This must only be used when the invoked method does nothing and has
  * no return value (the latter being very important for verification).
  */
-static bool rewriteDirectInvoke(Method* method, u2* insns)
+static bool rewriteEmptyDirectInvoke(Method* method, u2* insns)
 {
     ClassObject* clazz = method->clazz;
     Method* calledMethod;
@@ -2226,6 +2291,7 @@ Method* dvmOptResolveInterfaceMethod(ClassObject* referrer, u4 methodIdx)
 
     return resMethod;
 }
+
 /*
  * See if the method being called can be rewritten as an inline operation.
  * Works for invoke-virtual, invoke-direct, and invoke-static.
@@ -2265,6 +2331,45 @@ static bool rewriteExecuteInline(Method* method, u2* insns,
             insns[1] = (u2) inlineSubs->inlineIdx;
 
             //LOGI("DexOpt: execute-inline %s.%s --> %s.%s\n",
+            //    method->clazz->descriptor, method->name,
+            //    calledMethod->clazz->descriptor, calledMethod->name);
+            return true;
+        }
+
+        inlineSubs++;
+    }
+
+    return false;
+}
+
+/*
+ * See if the method being called can be rewritten as an inline operation.
+ * Works for invoke-virtual/range, invoke-direct/range, and invoke-static/range.
+ *
+ * Returns "true" if we replace it.
+ */
+static bool rewriteExecuteInlineRange(Method* method, u2* insns,
+    MethodType methodType, const InlineSub* inlineSubs)
+{
+    ClassObject* clazz = method->clazz;
+    Method* calledMethod;
+    u2 methodIdx = insns[1];
+
+    calledMethod = dvmOptResolveMethod(clazz, methodIdx, methodType, NULL);
+    if (calledMethod == NULL) {
+        LOGV("+++ DexOpt inline/range: can't find %d\n", methodIdx);
+        return false;
+    }
+
+    while (inlineSubs->method != NULL) {
+        if (inlineSubs->method == calledMethod) {
+            assert((insns[0] & 0xff) == OP_INVOKE_DIRECT_RANGE ||
+                   (insns[0] & 0xff) == OP_INVOKE_STATIC_RANGE ||
+                   (insns[0] & 0xff) == OP_INVOKE_VIRTUAL_RANGE);
+            insns[0] = (insns[0] & 0xff00) | (u2) OP_EXECUTE_INLINE_RANGE;
+            insns[1] = (u2) inlineSubs->inlineIdx;
+
+            //LOGI("DexOpt: execute-inline/range %s.%s --> %s.%s\n",
             //    method->clazz->descriptor, method->name,
             //    calledMethod->clazz->descriptor, calledMethod->name);
             return true;

@@ -825,7 +825,7 @@ static bool sendRequest(JdwpState* state, ExpandBuf* pReq)
     JdwpNetState* netState = state->netState;
     int cc;
 
-    dumpPacket(expandBufGetBuffer(pReq));
+    /*dumpPacket(expandBufGetBuffer(pReq));*/
     if (netState->clientSock < 0) {
         /* can happen with some DDMS events */
         LOGV("NOT sending request -- no debugger is attached\n");
@@ -849,9 +849,53 @@ static bool sendRequest(JdwpState* state, ExpandBuf* pReq)
     return true;
 }
 
+/*
+ * Send a request that was split into multiple buffers.
+ *
+ * The entire packet must be sent with a single writev() call to avoid
+ * threading issues.
+ *
+ * Returns "true" if it was sent successfully.
+ */
+static bool sendBufferedRequest(JdwpState* state, const struct iovec* iov,
+    int iovcnt)
+{
+    JdwpNetState* netState = state->netState;
+
+    if (netState->clientSock < 0) {
+        /* can happen with some DDMS events */
+        LOGV("NOT sending request -- no debugger is attached\n");
+        return false;
+    }
+
+    size_t expected = 0;
+    int i;
+    for (i = 0; i < iovcnt; i++)
+        expected += iov[i].iov_len;
+
+    /*
+     * TODO: we currently assume the writev() will complete in one
+     * go, which may not be safe for a network socket.  We may need
+     * to mutex this against handlePacket().
+     */
+    ssize_t actual;
+    actual = writev(netState->clientSock, iov, iovcnt);
+    if ((size_t)actual != expected) {
+        LOGE("Failed sending b-req to debugger: %s (%d of %zu)\n",
+            strerror(errno), (int) actual, expected);
+        return false;
+    }
+
+    return true;
+}
+
 
 /*
  * Our functions.
+ *
+ * We can't generally share the implementations with other transports,
+ * even if they're also socket-based, because our JdwpNetState will be
+ * different from theirs.
  */
 static const JdwpTransport socketTransport = {
     prepareSocket,
@@ -863,7 +907,8 @@ static const JdwpTransport socketTransport = {
     isConnected,
     awaitingHandshake,
     processIncoming,
-    sendRequest
+    sendRequest,
+    sendBufferedRequest,
 };
 
 /*

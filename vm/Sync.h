@@ -19,6 +19,50 @@
 #ifndef _DALVIK_SYNC
 #define _DALVIK_SYNC
 
+/*
+ * Monitor shape field.  Used to distinguish immediate thin locks from
+ * indirecting fat locks.
+ */
+#define LW_SHAPE_THIN 0
+#define LW_SHAPE_FAT 1
+#define LW_SHAPE_MASK 0x1
+#define LW_SHAPE(x) ((x) & LW_SHAPE_MASK)
+
+/*
+ * Hash state field.  Used to signify that an object has had its
+ * identity hash code exposed or relocated.
+ */
+#define LW_HASH_STATE_UNHASHED 0
+#define LW_HASH_STATE_HASHED 1
+#define LW_HASH_STATE_HASHED_AND_MOVED 3
+#define LW_HASH_STATE_MASK 0x3
+#define LW_HASH_STATE_SHIFT 1
+#define LW_HASH_STATE(x) (((x) >> LW_HASH_STATE_SHIFT) & LW_HASH_STATE_MASK)
+
+/*
+ * Monitor accessor.  Extracts a monitor structure pointer from a fat
+ * lock.  Performs no error checking.
+ */
+#define LW_MONITOR(x) \
+  ((Monitor*)((x) & ~((LW_HASH_STATE_MASK << LW_HASH_STATE_SHIFT) | \
+                      LW_SHAPE_MASK)))
+
+/*
+ * Lock owner field.  Contains the thread id of the thread currently
+ * holding the lock.
+ */
+#define LW_LOCK_OWNER_MASK 0xffff
+#define LW_LOCK_OWNER_SHIFT 3
+#define LW_LOCK_OWNER(x) (((x) >> LW_LOCK_OWNER_SHIFT) & LW_LOCK_OWNER_MASK)
+
+/*
+ * Lock recursion count field.  Contains a count of the numer of times
+ * a lock has been recursively acquired.
+ */
+#define LW_LOCK_COUNT_MASK 0x1fff
+#define LW_LOCK_COUNT_SHIFT 19
+#define LW_LOCK_COUNT(x) (((x) >> LW_LOCK_COUNT_SHIFT) & LW_LOCK_COUNT_MASK)
+
 struct Object;
 struct Monitor;
 struct Thread;
@@ -27,34 +71,18 @@ typedef struct Monitor Monitor;
 #define QUIET_ZYGOTE_MONITOR 1
 
 /*
- * Synchronization lock, included in every object.
- *
- * We want this to be a 32-bit "thin lock", holding the lock level and
- * the owner's threadId, that inflates to a Monitor pointer when there
- * is contention or somebody waits on it.
- */
-typedef union Lock {
-    u4          thin;
-    Monitor*    mon;
-} Lock;
-
-/*
  * Initialize a Lock to the proper starting value.
  * This is necessary for thin locking.
  */
-#define THIN_LOCKING 1
-#if THIN_LOCKING
-#define DVM_LOCK_INITIAL_THIN_VALUE (0x1)
-#else
 #define DVM_LOCK_INITIAL_THIN_VALUE (0)
-#endif
+
 #define DVM_LOCK_INIT(lock) \
-    do { (lock)->thin = DVM_LOCK_INITIAL_THIN_VALUE; } while (0)
+    do { *(lock) = DVM_LOCK_INITIAL_THIN_VALUE; } while (0)
 
 /*
  * Returns true if the lock has been fattened.
  */
-#define IS_LOCK_FAT(lock)   (((lock)->thin & 1) == 0 && (lock)->mon != NULL)
+#define IS_LOCK_FAT(lock)   (LW_SHAPE(*(lock)) == LW_SHAPE_FAT)
 
 /*
  * Acquire the object's monitor.
@@ -75,6 +103,11 @@ void dvmObjectNotify(struct Thread* self, struct Object* obj);
 void dvmObjectNotifyAll(struct Thread* self, struct Object* obj);
 
 /*
+ * Implementation of System.identityHashCode().
+ */
+u4 dvmIdentityHashCode(struct Object* obj);
+
+/*
  * Implementation of Thread.sleep().
  */
 void dvmThreadSleep(u8 msec, u4 nsec);
@@ -84,20 +117,17 @@ void dvmThreadSleep(u8 msec, u4 nsec);
  *
  * Interrupt a thread.  If it's waiting on a monitor, wake it up.
  */
-void dvmThreadInterrupt(volatile struct Thread* thread);
+void dvmThreadInterrupt(struct Thread* thread);
 
 /* create a new Monitor struct */
 Monitor* dvmCreateMonitor(struct Object* obj);
 
-/* free an object's monitor during GC */
-void dvmFreeObjectMonitor_internal(Lock* lock);
-#define dvmFreeObjectMonitor(obj) \
-    do { \
-        Object *DFM_obj_ = (obj); \
-        if (IS_LOCK_FAT(&DFM_obj_->lock)) { \
-            dvmFreeObjectMonitor_internal(&DFM_obj_->lock); \
-        } \
-    } while (0)
+/*
+ * Frees unmarked monitors from the monitor list.  The given callback
+ * routine should return a non-zero value when passed a pointer to an
+ * unmarked object.
+ */
+void dvmSweepMonitorList(Monitor** mon, int (*isUnmarkedObject)(void*));
 
 /* free monitor list */
 void dvmFreeMonitorList(void);
@@ -111,9 +141,23 @@ void dvmFreeMonitorList(void);
 struct Object* dvmGetMonitorObject(Monitor* mon);
 
 /*
+ * Get the thread that holds the lock on the specified object.  The
+ * object may be unlocked, thin-locked, or fat-locked.
+ *
+ * The caller must lock the thread list before calling here.
+ */
+struct Thread* dvmGetObjectLockHolder(struct Object* obj);
+
+/*
  * Checks whether the object is held by the specified thread.
  */
 bool dvmHoldsLock(struct Thread* thread, struct Object* obj);
+
+/*
+ * Relative timed wait on condition
+ */
+int dvmRelativeCondWait(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                         s8 msec, s4 nsec);
 
 /*
  * Debug.

@@ -113,6 +113,18 @@ INLINE bool dvmIsArray(const ArrayObject* arrayObj)
 }
 
 /*
+ * Verify that the array is an object array and not a primitive array.
+ *
+ * Does not verify that the object is actually a non-NULL object.
+ */
+INLINE bool dvmIsObjectArray(const ArrayObject* arrayObj)
+{
+    const char* descriptor = arrayObj->obj.clazz->descriptor;
+    return descriptor[0] == '[' && (descriptor[1] == 'L' ||
+                                    descriptor[1] == '[');
+}
+
+/*
  * Verify that the class is an array class.
  *
  * TODO: there may be some performance advantage to setting a flag in
@@ -130,6 +142,14 @@ INLINE bool dvmIsArrayClass(const ClassObject* clazz)
  * "dstElemClass" is the type of element that "dstArray" holds.
  */
 bool dvmCopyObjectArray(ArrayObject* dstArray, const ArrayObject* srcArray,
+    ClassObject* dstElemClass);
+
+/*
+ * Copy the entire contents of an array of boxed primitives into an
+ * array of primitives.  The boxed value must fit in the primitive (i.e.
+ * narrowing conversions are not allowed).
+ */
+bool dvmUnboxObjectArray(ArrayObject* dstArray, const ArrayObject* srcArray,
     ClassObject* dstElemClass);
 
 #endif /*_DALVIK_OO_ARRAY*/

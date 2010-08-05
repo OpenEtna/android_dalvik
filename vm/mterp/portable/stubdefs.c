@@ -19,6 +19,8 @@
  *
  * Assumes the existence of "const u2* pc" and (for threaded operation)
  * "u2 inst".
+ *
+ * TODO: remove "switch" version.
  */
 #ifdef THREADED_INTERP
 # define H(_op)             &&op_##_op
@@ -28,12 +30,16 @@
         inst = FETCH(0);                                                    \
         CHECK_DEBUG_AND_PROF();                                             \
         CHECK_TRACKED_REFS();                                               \
-        CHECK_JIT();                                                        \
+        if (CHECK_JIT()) GOTO_bail_switch();                                \
         goto *handlerTable[INST_INST(inst)];                                \
+    }
+# define FINISH_BKPT(_opcode) {                                             \
+        goto *handlerTable[_opcode];                                        \
     }
 #else
 # define HANDLE_OPCODE(_op) case _op:
 # define FINISH(_offset)    { ADJUST_PC(_offset); break; }
+# define FINISH_BKPT(opcode) { > not implemented < }
 #endif
 
 #define OP_END
@@ -88,4 +94,3 @@
             GOTO_bail_switch();                                             \
         }                                                                   \
     }
-

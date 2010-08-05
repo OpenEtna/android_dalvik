@@ -25,16 +25,21 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <sys/resource.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
-
-#include <cutils/sched_policy.h>
 
 #if defined(HAVE_PRCTL)
 #include <sys/prctl.h>
 #endif
+
+#if defined(WITH_SELF_VERIFICATION)
+#include "interp/Jit.h"         // need for self verification
+#endif
+
 
 /* desktop Linux needs a little help with gettid() */
 #if defined(HAVE_GETTID) && !defined(HAVE_ANDROID_OS)
@@ -219,8 +224,8 @@ Some other concerns with flinging signals around:
    use printf on stdout to print GC debug messages)
 */
 
-#define kMaxThreadId        ((1<<15) - 1)
-#define kMainThreadId       ((1<<1) | 1)
+#define kMaxThreadId        ((1 << 16) - 1)
+#define kMainThreadId       1
 
 
 static Thread* allocThread(int interpStackSize);
@@ -516,6 +521,12 @@ static const char* getSuspendCauseStr(SuspendCause why)
     case SUSPEND_FOR_DEBUG:         return "debug";
     case SUSPEND_FOR_DEBUG_EVENT:   return "debug-event";
     case SUSPEND_FOR_STACK_DUMP:    return "stack-dump";
+#if defined(WITH_JIT)
+    case SUSPEND_FOR_TBL_RESIZE:    return "table-resize";
+    case SUSPEND_FOR_IC_PATCH:      return "inline-cache-patch";
+    case SUSPEND_FOR_CC_RESET:      return "reset-code-cache";
+    case SUSPEND_FOR_REFRESH:       return "refresh jit status";
+#endif
     default:                        return "UNKNOWN";
     }
 }
@@ -554,6 +565,9 @@ static void lockThreadSuspend(const char* who, SuspendCause why)
                  *
                  * Could be the debugger telling us to resume at roughly
                  * the same time we're posting an event.
+                 *
+                 * Could be two app threads both want to patch predicted
+                 * chaining cells around the same time.
                  */
                 LOGI("threadid=%d ODD: want thread-suspend lock (%s:%s),"
                      " it's held, no suspend pending\n",
@@ -667,6 +681,8 @@ void dvmSlayDaemons(void)
     dvmUnlockThreadList();
 
     if (doWait) {
+        bool complained = false;
+
         usleep(200 * 1000);
 
         dvmLockThreadList(self);
@@ -687,9 +703,10 @@ void dvmSlayDaemons(void)
                 }
 
                 if (target->status == THREAD_RUNNING && !target->isSuspended) {
-                    LOGD("threadid=%d not ready yet\n", target->threadId);
+                    if (!complained)
+                        LOGD("threadid=%d not ready yet\n", target->threadId);
                     allSuspended = false;
-                    break;
+                    /* keep going so we log each running daemon once */
                 }
 
                 target = target->next;
@@ -699,7 +716,11 @@ void dvmSlayDaemons(void)
                 LOGD("threadid=%d: all daemons have suspended\n", threadId);
                 break;
             } else {
-                LOGD("threadid=%d: waiting for daemons to suspend\n", threadId);
+                if (!complained) {
+                    complained = true;
+                    LOGD("threadid=%d: waiting briefly for daemon suspension\n",
+                        threadId);
+                }
             }
 
             usleep(200 * 1000);
@@ -895,6 +916,11 @@ static Thread* allocThread(int interpStackSize)
     if (thread == NULL)
         return NULL;
 
+#if defined(WITH_SELF_VERIFICATION)
+    if (dvmSelfVerificationShadowSpaceAlloc(thread) == NULL)
+        return NULL;
+#endif
+
     assert(interpStackSize >= kMinStackSize && interpStackSize <=kMaxStackSize);
 
     thread->status = THREAD_INITIALIZING;
@@ -914,6 +940,9 @@ static Thread* allocThread(int interpStackSize)
 #ifdef MALLOC_INTERP_STACK
     stackBottom = (u1*) malloc(interpStackSize);
     if (stackBottom == NULL) {
+#if defined(WITH_SELF_VERIFICATION)
+        dvmSelfVerificationShadowSpaceFree(thread);
+#endif
         free(thread);
         return NULL;
     }
@@ -922,6 +951,9 @@ static Thread* allocThread(int interpStackSize)
     stackBottom = mmap(NULL, interpStackSize, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (stackBottom == MAP_FAILED) {
+#if defined(WITH_SELF_VERIFICATION)
+        dvmSelfVerificationShadowSpaceFree(thread);
+#endif
         free(thread);
         return NULL;
     }
@@ -977,7 +1009,7 @@ static bool prepareThread(Thread* thread)
     /*
      * Initialize invokeReq.
      */
-    pthread_mutex_init(&thread->invokeReq.lock, NULL);
+    dvmInitMutex(&thread->invokeReq.lock);
     pthread_cond_init(&thread->invokeReq.cv, NULL);
 
     /*
@@ -1004,6 +1036,9 @@ static bool prepareThread(Thread* thread)
         return false;
 
     memset(&thread->jniMonitorRefTable, 0, sizeof(thread->jniMonitorRefTable));
+
+    pthread_cond_init(&thread->waitCond, NULL);
+    dvmInitMutex(&thread->waitMutex);
 
     return true;
 }
@@ -1061,6 +1096,9 @@ static void freeThread(Thread* thread)
     if (&thread->jniMonitorRefTable.table != NULL)
         dvmClearReferenceTable(&thread->jniMonitorRefTable);
 
+#if defined(WITH_SELF_VERIFICATION)
+    dvmSelfVerificationShadowSpaceFree(thread);
+#endif
     free(thread);
 }
 
@@ -1098,7 +1136,7 @@ static void setThreadSelf(Thread* thread)
  * This is associated with the pthreadKeySelf key.  It's called by the
  * pthread library when a thread is exiting and the "self" pointer in TLS
  * is non-NULL, meaning the VM hasn't had a chance to clean up.  In normal
- * operation this should never be called.
+ * operation this will not be called.
  *
  * This is mainly of use to ensure that we don't leak resources if, for
  * example, a thread attaches itself to us with AttachCurrentThread and
@@ -1109,16 +1147,43 @@ static void setThreadSelf(Thread* thread)
  * will simply be unaware that the thread has exited, leading to resource
  * leaks (and, if this is a non-daemon thread, an infinite hang when the
  * VM tries to shut down).
+ *
+ * Because some implementations may want to use the pthread destructor
+ * to initiate the detach, and the ordering of destructors is not defined,
+ * we want to iterate a couple of times to give those a chance to run.
  */
 static void threadExitCheck(void* arg)
 {
-    Thread* thread = (Thread*) arg;
+    const int kMaxCount = 2;
 
-    LOGI("In threadExitCheck %p\n", arg);
-    assert(thread != NULL);
+    Thread* self = (Thread*) arg;
+    assert(self != NULL);
 
-    if (thread->status != THREAD_ZOMBIE) {
-        LOGE("Native thread exited without telling us\n");
+    LOGV("threadid=%d: threadExitCheck(%p) count=%d\n",
+        self->threadId, arg, self->threadExitCheckCount);
+
+    if (self->status == THREAD_ZOMBIE) {
+        LOGW("threadid=%d: Weird -- shouldn't be in threadExitCheck\n",
+            self->threadId);
+        return;
+    }
+
+    if (self->threadExitCheckCount < kMaxCount) {
+        /*
+         * Spin a couple of times to let other destructors fire.
+         */
+        LOGD("threadid=%d: thread exiting, not yet detached (count=%d)\n",
+            self->threadId, self->threadExitCheckCount);
+        self->threadExitCheckCount++;
+        int cc = pthread_setspecific(gDvm.pthreadKeySelf, self);
+        if (cc != 0) {
+            LOGE("threadid=%d: unable to re-add thread to TLS\n",
+                self->threadId);
+            dvmAbort();
+        }
+    } else {
+        LOGE("threadid=%d: native thread exited without detaching\n",
+            self->threadId);
         dvmAbort();
     }
 }
@@ -1135,12 +1200,10 @@ static void threadExitCheck(void* arg)
  */
 static void assignThreadId(Thread* thread)
 {
-    /* Find a small unique integer.  threadIdMap is a vector of
+    /*
+     * Find a small unique integer.  threadIdMap is a vector of
      * kMaxThreadId bits;  dvmAllocBit() returns the index of a
      * bit, meaning that it will always be < kMaxThreadId.
-     *
-     * The thin locking magic requires that the low bit is always
-     * set, so we do it once, here.
      */
     int num = dvmAllocBit(gDvm.threadIdMap);
     if (num < 0) {
@@ -1148,7 +1211,7 @@ static void assignThreadId(Thread* thread)
         dvmAbort();     // TODO: make this a non-fatal error result
     }
 
-    thread->threadId = ((num + 1) << 1) | 1;
+    thread->threadId = num + 1;
 
     assert(thread->threadId != 0);
     assert(thread->threadId != DVM_LOCK_INITIAL_THIN_VALUE);
@@ -1160,7 +1223,7 @@ static void assignThreadId(Thread* thread)
 static void releaseThreadId(Thread* thread)
 {
     assert(thread->threadId > 0);
-    dvmClearBit(gDvm.threadIdMap, (thread->threadId >> 1) - 1);
+    dvmClearBit(gDvm.threadIdMap, thread->threadId - 1);
     thread->threadId = 0;
 }
 
@@ -1229,8 +1292,6 @@ static bool createFakeRunFrame(Thread* thread)
     ClassObject* nativeStart;
     Method* runMeth;
 
-    assert(thread->threadId != 1);      // not for main thread
-
     nativeStart =
         dvmFindSystemClassNoInit("Ldalvik/system/NativeStart;");
     if (nativeStart == NULL) {
@@ -1252,7 +1313,6 @@ static bool createFakeRunFrame(Thread* thread)
  */
 static void setThreadName(const char *threadName)
 {
-#if defined(HAVE_PRCTL)
     int hasAt = 0;
     int hasDot = 0;
     const char *s = threadName;
@@ -1267,7 +1327,13 @@ static void setThreadName(const char *threadName)
     } else {
         s = threadName + len - 15;
     }
+#if defined(HAVE_PTHREAD_SETNAME_NP)
+    if (pthread_setname_np(pthread_self(), s) != 0)
+        LOGW("Unable to set the name of the current thread\n");
+#elif defined(HAVE_PRCTL)
     prctl(PR_SET_NAME, (unsigned long) s, 0, 0, 0);
+#else
+    LOGD("Unable to set current thread's name: %s\n", s);
 #endif
 }
 
@@ -2419,35 +2485,101 @@ static void printBackTrace(void) {}
  */
 static void dumpWedgedThread(Thread* thread)
 {
-    char exePath[1024];
-
-    /*
-     * The "executablepath" function in libutils is host-side only.
-     */
-    strcpy(exePath, "-");
-#ifdef HAVE_GLIBC
-    {
-        char proc[100];
-        sprintf(proc, "/proc/%d/exe", getpid());
-        int len;
-
-        len = readlink(proc, exePath, sizeof(exePath)-1);
-        exePath[len] = '\0';
-    }
-#endif
-
-    LOGW("dumping state: process %s %d\n", exePath, getpid());
     dvmDumpThread(dvmThreadSelf(), false);
     printBackTrace();
 
     // dumping a running thread is risky, but could be useful
     dvmDumpThread(thread, true);
 
-
     // stop now and get a core dump
     //abort();
 }
 
+/*
+ * If the thread is running at below-normal priority, temporarily elevate
+ * it to "normal".
+ *
+ * Returns zero if no changes were made.  Otherwise, returns bit flags
+ * indicating what was changed, storing the previous values in the
+ * provided locations.
+ */
+int dvmRaiseThreadPriorityIfNeeded(Thread* thread, int* pSavedThreadPrio,
+    SchedPolicy* pSavedThreadPolicy)
+{
+    errno = 0;
+    *pSavedThreadPrio = getpriority(PRIO_PROCESS, thread->systemTid);
+    if (errno != 0) {
+        LOGW("Unable to get priority for threadid=%d sysTid=%d\n",
+            thread->threadId, thread->systemTid);
+        return 0;
+    }
+    if (get_sched_policy(thread->systemTid, pSavedThreadPolicy) != 0) {
+        LOGW("Unable to get policy for threadid=%d sysTid=%d\n",
+            thread->threadId, thread->systemTid);
+        return 0;
+    }
+
+    int changeFlags = 0;
+
+    /*
+     * Change the priority if we're in the background group.
+     */
+    if (*pSavedThreadPolicy == SP_BACKGROUND) {
+        if (set_sched_policy(thread->systemTid, SP_FOREGROUND) != 0) {
+            LOGW("Couldn't set fg policy on tid %d\n", thread->systemTid);
+        } else {
+            changeFlags |= kChangedPolicy;
+            LOGD("Temporarily moving tid %d to fg (was %d)\n",
+                thread->systemTid, *pSavedThreadPolicy);
+        }
+    }
+
+    /*
+     * getpriority() returns the "nice" value, so larger numbers indicate
+     * lower priority, with 0 being normal.
+     */
+    if (*pSavedThreadPrio > 0) {
+        const int kHigher = 0;
+        if (setpriority(PRIO_PROCESS, thread->systemTid, kHigher) != 0) {
+            LOGW("Couldn't raise priority on tid %d to %d\n",
+                thread->systemTid, kHigher);
+        } else {
+            changeFlags |= kChangedPriority;
+            LOGD("Temporarily raised priority on tid %d (%d -> %d)\n",
+                thread->systemTid, *pSavedThreadPrio, kHigher);
+        }
+    }
+
+    return changeFlags;
+}
+
+/*
+ * Reset the priority values for the thread in question.
+ */
+void dvmResetThreadPriority(Thread* thread, int changeFlags,
+    int savedThreadPrio, SchedPolicy savedThreadPolicy)
+{
+    if ((changeFlags & kChangedPolicy) != 0) {
+        if (set_sched_policy(thread->systemTid, savedThreadPolicy) != 0) {
+            LOGW("NOTE: couldn't reset tid %d to (%d)\n",
+                thread->systemTid, savedThreadPolicy);
+        } else {
+            LOGD("Restored policy of %d to %d\n",
+                thread->systemTid, savedThreadPolicy);
+        }
+    }
+
+    if ((changeFlags & kChangedPriority) != 0) {
+        if (setpriority(PRIO_PROCESS, thread->systemTid, savedThreadPrio) != 0)
+        {
+            LOGW("NOTE: couldn't reset priority on thread %d to %d\n",
+                thread->systemTid, savedThreadPrio);
+        } else {
+            LOGD("Restored priority on %d to %d\n",
+                thread->systemTid, savedThreadPrio);
+        }
+    }
+}
 
 /*
  * Wait for another thread to see the pending suspension and stop running.
@@ -2480,8 +2612,9 @@ static void waitForThreadSuspend(Thread* self, Thread* thread)
     const int kMaxRetries = 10;
     int spinSleepTime = FIRST_SLEEP;
     bool complained = false;
-    bool needPriorityReset = false;
+    int priChangeFlags = 0;
     int savedThreadPrio = -500;
+    SchedPolicy savedThreadPolicy = SP_FOREGROUND;
 
     int sleepIter = 0;
     int retryCount = 0;
@@ -2498,63 +2631,59 @@ static void waitForThreadSuspend(Thread* self, Thread* thread)
              * After waiting for a bit, check to see if the target thread is
              * running at a reduced priority.  If so, bump it up temporarily
              * to give it more CPU time.
-             *
-             * getpriority() returns the "nice" value, so larger numbers
-             * indicate lower priority.
-             *
-             * (Not currently changing the cgroup.  Wasn't necessary in some
-             * simple experiments.)
              */
             if (retryCount == 2) {
                 assert(thread->systemTid != 0);
-                errno = 0;
-                int threadPrio = getpriority(PRIO_PROCESS, thread->systemTid);
-                if (errno == 0 && threadPrio > 0) {
-                    const int kHigher = 0;
-                    if (setpriority(PRIO_PROCESS, thread->systemTid, kHigher) < 0)
-                    {
-                        LOGW("Couldn't raise priority on tid %d to %d\n",
-                            thread->systemTid, kHigher);
-                    } else {
-                        savedThreadPrio = threadPrio;
-                        needPriorityReset = true;
-                        LOGD("Temporarily raising priority on tid %d (%d -> %d)\n",
-                            thread->systemTid, threadPrio, kHigher);
-                    }
-                }
+                priChangeFlags = dvmRaiseThreadPriorityIfNeeded(thread,
+                    &savedThreadPrio, &savedThreadPolicy);
             }
         }
 
 #if defined (WITH_JIT)
         /*
-         * If we're still waiting after the first timeout,
-         * unchain all translations.
+         * If we're still waiting after the first timeout, unchain all
+         * translations iff:
+         *   1) There are new chains formed since the last unchain
+         *   2) The top VM frame of the running thread is running JIT'ed code
          */
-        if (gDvmJit.pJitEntryTable && retryCount > 0) {
-            LOGD("JIT unchain all attempt #%d",retryCount);
+        if (gDvmJit.pJitEntryTable && retryCount > 0 &&
+            gDvmJit.hasNewChain && thread->inJitCodeCache) {
+            LOGD("JIT unchain all for threadid=%d", thread->threadId);
             dvmJitUnchainAll();
         }
 #endif
 
         /*
-         * Sleep briefly.  This returns false if we've exceeded the total
-         * time limit for this round of sleeping.
+         * Sleep briefly.  The iterative sleep call returns false if we've
+         * exceeded the total time limit for this round of sleeping.
          */
         if (!dvmIterativeSleep(sleepIter++, spinSleepTime, startWhen)) {
-            LOGW("threadid=%d: spin on suspend #%d threadid=%d (h=%d)\n",
-                self->threadId, retryCount,
-                thread->threadId, (int)thread->handle);
-            dumpWedgedThread(thread);
-            complained = true;
+            if (spinSleepTime != FIRST_SLEEP) {
+                LOGW("threadid=%d: spin on suspend #%d threadid=%d (pcf=%d)\n",
+                    self->threadId, retryCount,
+                    thread->threadId, priChangeFlags);
+                if (retryCount > 1) {
+                    /* stack trace logging is slow; skip on first iter */
+                    dumpWedgedThread(thread);
+                }
+                complained = true;
+            }
 
             // keep going; could be slow due to valgrind
             sleepIter = 0;
             spinSleepTime = MORE_SLEEP;
 
             if (retryCount++ == kMaxRetries) {
+                LOGE("Fatal spin-on-suspend, dumping threads\n");
+                dvmDumpAllThreads(false);
+
+                /* log this after -- long traces will scroll off log */
                 LOGE("threadid=%d: stuck on threadid=%d, giving up\n",
                     self->threadId, thread->threadId);
-                dvmDumpAllThreads(false);
+
+                /* try to get a debuggerd dump from the spinning thread */
+                dvmNukeThread(thread);
+                /* abort the VM */
                 dvmAbort();
             }
         }
@@ -2566,14 +2695,9 @@ static void waitForThreadSuspend(Thread* self, Thread* thread)
             (dvmGetRelativeTimeUsec() - firstStartWhen) / 1000);
         //dvmDumpThread(thread, false);   /* suspended, so dump is safe */
     }
-    if (needPriorityReset) {
-        if (setpriority(PRIO_PROCESS, thread->systemTid, savedThreadPrio) < 0) {
-            LOGW("NOTE: couldn't reset priority on thread %d to %d\n",
-                thread->systemTid, savedThreadPrio);
-        } else {
-            LOGV("Restored priority on %d to %d\n",
-                thread->systemTid, savedThreadPrio);
-        }
+    if (priChangeFlags != 0) {
+        dvmResetThreadPriority(thread, priChangeFlags, savedThreadPrio,
+            savedThreadPolicy);
     }
 }
 
@@ -3043,6 +3167,38 @@ Thread* dvmGetThreadFromThreadObject(Object* vmThreadObj)
     return (Thread*) vmData;
 }
 
+/*
+ * Given a pthread handle, return the associated Thread*.
+ * Caller must hold the thread list lock.
+ *
+ * Returns NULL if the thread was not found.
+ */
+Thread* dvmGetThreadByHandle(pthread_t handle)
+{
+    Thread* thread;
+    for (thread = gDvm.threadList; thread != NULL; thread = thread->next) {
+        if (thread->handle == handle)
+            break;
+    }
+    return thread;
+}
+
+/*
+ * Given a threadId, return the associated Thread*.
+ * Caller must hold the thread list lock.
+ *
+ * Returns NULL if the thread was not found.
+ */
+Thread* dvmGetThreadByThreadId(u4 threadId)
+{
+    Thread* thread;
+    for (thread = gDvm.threadList; thread != NULL; thread = thread->next) {
+        if (thread->threadId == threadId)
+            break;
+    }
+    return thread;
+}
+
 
 /*
  * Conversion map for "nice" values.
@@ -3161,51 +3317,94 @@ void dvmDumpThread(Thread* thread, bool isRunning)
 /*
  * Try to get the scheduler group.
  *
- * The data from /proc/<pid>/cgroup looks like:
+ * The data from /proc/<pid>/cgroup looks (something) like:
  *  2:cpu:/bg_non_interactive
+ *  1:cpuacct:/
  *
  * We return the part after the "/", which will be an empty string for
  * the default cgroup.  If the string is longer than "bufLen", the string
  * will be truncated.
+ *
+ * TODO: this is cloned from a static function in libcutils; expose that?
  */
-static bool getSchedulerGroup(Thread* thread, char* buf, size_t bufLen)
+static int getSchedulerGroup(int tid, char* buf, size_t bufLen)
 {
 #ifdef HAVE_ANDROID_OS
     char pathBuf[32];
-    char readBuf[256];
-    ssize_t count;
-    int fd;
+    char lineBuf[256];
+    FILE *fp;
 
-    snprintf(pathBuf, sizeof(pathBuf), "/proc/%d/cgroup", thread->systemTid);
-    if ((fd = open(pathBuf, O_RDONLY)) < 0) {
-        LOGV("open(%s) failed: %s\n", pathBuf, strerror(errno));
-        return false;
+    snprintf(pathBuf, sizeof(pathBuf), "/proc/%d/cgroup", tid);
+    if (!(fp = fopen(pathBuf, "r"))) {
+        return -1;
     }
 
-    count = read(fd, readBuf, sizeof(readBuf));
-    if (count <= 0) {
-        LOGV("read(%s) failed (%d): %s\n",
-            pathBuf, (int) count, strerror(errno));
-        close(fd);
-        return false;
+    while(fgets(lineBuf, sizeof(lineBuf) -1, fp)) {
+        char *next = lineBuf;
+        char *subsys;
+        char *grp;
+        size_t len;
+
+        /* Junk the first field */
+        if (!strsep(&next, ":")) {
+            goto out_bad_data;
+        }
+
+        if (!(subsys = strsep(&next, ":"))) {
+            goto out_bad_data;
+        }
+
+        if (strcmp(subsys, "cpu")) {
+            /* Not the subsys we're looking for */
+            continue;
+        }
+
+        if (!(grp = strsep(&next, ":"))) {
+            goto out_bad_data;
+        }
+        grp++; /* Drop the leading '/' */
+        len = strlen(grp);
+        grp[len-1] = '\0'; /* Drop the trailing '\n' */
+
+        if (bufLen <= len) {
+            len = bufLen - 1;
+        }
+        strncpy(buf, grp, len);
+        buf[len] = '\0';
+        fclose(fp);
+        return 0;
     }
-    close(fd);
 
-    readBuf[--count] = '\0';    /* remove the '\n', now count==strlen */
-
-    char* cp = strchr(readBuf, '/');
-    if (cp == NULL) {
-        readBuf[sizeof(readBuf)-1] = '\0';
-        LOGV("no '/' in '%s' (file=%s count=%d)\n",
-            readBuf, pathBuf, (int) count);
-        return false;
-    }
-
-    memcpy(buf, cp+1, count);   /* count-1 for cp+1, count+1 for NUL */
-    return true;
+    LOGE("Failed to find cpu subsys");
+    fclose(fp);
+    return -1;
+ out_bad_data:
+    LOGE("Bad cgroup data {%s}", lineBuf);
+    fclose(fp);
+    return -1;
 #else
-    return false;
+    errno = ENOSYS;
+    return -1;
 #endif
+}
+
+/*
+ * Convert ThreadStatus to a string.
+ */
+const char* dvmGetThreadStatusStr(ThreadStatus status)
+{
+    switch (status) {
+    case THREAD_ZOMBIE:         return "ZOMBIE";
+    case THREAD_RUNNING:        return "RUNNABLE";
+    case THREAD_TIMED_WAIT:     return "TIMED_WAIT";
+    case THREAD_MONITOR:        return "MONITOR";
+    case THREAD_WAIT:           return "WAIT";
+    case THREAD_INITIALIZING:   return "INITIALIZING";
+    case THREAD_STARTING:       return "STARTING";
+    case THREAD_NATIVE:         return "NATIVE";
+    case THREAD_VMWAIT:         return "VMWAIT";
+    default:                    return "UNKNOWN";
+    }
 }
 
 /*
@@ -3218,11 +3417,6 @@ static bool getSchedulerGroup(Thread* thread, char* buf, size_t bufLen)
 void dvmDumpThreadEx(const DebugOutputTarget* target, Thread* thread,
     bool isRunning)
 {
-    /* tied to ThreadStatus enum */
-    static const char* kStatusNames[] = {
-        "ZOMBIE", "RUNNABLE", "TIMED_WAIT", "MONITOR", "WAIT",
-        "INITIALIZING", "STARTING", "NATIVE", "VMWAIT"
-    };
     Object* threadObj;
     Object* groupObj;
     StringObject* nameStr;
@@ -3233,6 +3427,8 @@ void dvmDumpThreadEx(const DebugOutputTarget* target, Thread* thread,
     int priority;               // java.lang.Thread priority
     int policy;                 // pthread policy
     struct sched_param sp;      // pthread scheduling parameters
+    char schedstatBuf[64];      // contents of /proc/[pid]/task/[tid]/schedstat
+    int schedstatFd;
 
     threadObj = thread->threadObj;
     if (threadObj == NULL) {
@@ -3251,7 +3447,8 @@ void dvmDumpThreadEx(const DebugOutputTarget* target, Thread* thread,
         policy = -1;
         sp.sched_priority = -1;
     }
-    if (!getSchedulerGroup(thread, schedulerGroupBuf,sizeof(schedulerGroupBuf)))
+    if (getSchedulerGroup(thread->systemTid, schedulerGroupBuf,
+            sizeof(schedulerGroupBuf)) != 0)
     {
         strcpy(schedulerGroupBuf, "unknown");
     } else if (schedulerGroupBuf[0] == '\0') {
@@ -3274,11 +3471,16 @@ void dvmDumpThreadEx(const DebugOutputTarget* target, Thread* thread,
     if (groupName == NULL)
         groupName = strdup("(BOGUS GROUP)");
 
-    assert(thread->status < NELEM(kStatusNames));
     dvmPrintDebugMessage(target,
-        "\"%s\"%s prio=%d tid=%d %s\n",
+        "\"%s\"%s prio=%d tid=%d %s%s\n",
         threadName, isDaemon ? " daemon" : "",
-        priority, thread->threadId, kStatusNames[thread->status]);
+        priority, thread->threadId, dvmGetThreadStatusStr(thread->status),
+#if defined(WITH_JIT)
+        thread->inJitCodeCache ? " JIT" : ""
+#else
+        ""
+#endif
+        );
     dvmPrintDebugMessage(target,
         "  | group=\"%s\" sCount=%d dsCount=%d s=%c obj=%p self=%p\n",
         groupName, thread->suspendCount, thread->dbgSuspendCount,
@@ -3288,6 +3490,19 @@ void dvmDumpThreadEx(const DebugOutputTarget* target, Thread* thread,
         thread->systemTid, getpriority(PRIO_PROCESS, thread->systemTid),
         policy, sp.sched_priority, schedulerGroupBuf, (int)thread->handle);
 
+    snprintf(schedstatBuf, sizeof(schedstatBuf), "/proc/%d/task/%d/schedstat",
+             getpid(), thread->systemTid);
+    schedstatFd = open(schedstatBuf, O_RDONLY);
+    if (schedstatFd >= 0) {
+        int bytes;
+        bytes = read(schedstatFd, schedstatBuf, sizeof(schedstatBuf) - 1);
+        close(schedstatFd);
+        if (bytes > 1) {
+            schedstatBuf[bytes-1] = 0;  // trailing newline
+            dvmPrintDebugMessage(target, "  | schedstat=( %s )\n", schedstatBuf);
+        }
+    }
+
 #ifdef WITH_MONITOR_TRACKING
     if (!isRunning) {
         LockedObjectData* lod = thread->pLockedObjects;
@@ -3296,8 +3511,16 @@ void dvmDumpThreadEx(const DebugOutputTarget* target, Thread* thread,
         else
             dvmPrintDebugMessage(target, "  | monitors held: <none>\n");
         while (lod != NULL) {
-            dvmPrintDebugMessage(target, "  >  %p[%d] (%s)\n",
-                lod->obj, lod->recursionCount, lod->obj->clazz->descriptor);
+            Object* obj = lod->obj;
+            if (obj->clazz == gDvm.classJavaLangClass) {
+                ClassObject* clazz = (ClassObject*) obj;
+                dvmPrintDebugMessage(target, "  >  %p[%d] (%s object for class %s)\n",
+                    obj, lod->recursionCount, obj->clazz->descriptor,
+                    clazz->descriptor);
+            } else {
+                dvmPrintDebugMessage(target, "  >  %p[%d] (%s)\n",
+                    obj, lod->recursionCount, obj->clazz->descriptor);
+            }
             lod = lod->next;
         }
     }
@@ -3375,6 +3598,55 @@ void dvmDumpAllThreadsEx(const DebugOutputTarget* target, bool grabLock)
 
     if (grabLock)
         dvmUnlockThreadList();
+}
+
+/*
+ * Nuke the target thread from orbit.
+ *
+ * The idea is to send a "crash" signal to the target thread so that
+ * debuggerd will take notice and dump an appropriate stack trace.
+ * Because of the way debuggerd works, we have to throw the same signal
+ * at it twice.
+ *
+ * This does not necessarily cause the entire process to stop, but once a
+ * thread has been nuked the rest of the system is likely to be unstable.
+ * This returns so that some limited set of additional operations may be
+ * performed, but it's advisable (and expected) to call dvmAbort soon.
+ * (This is NOT a way to simply cancel a thread.)
+ */
+void dvmNukeThread(Thread* thread)
+{
+    /* suppress the heapworker watchdog to assist anyone using a debugger */
+    gDvm.nativeDebuggerActive = true;
+
+    /*
+     * Send the signals, separated by a brief interval to allow debuggerd
+     * to work its magic.  An uncommon signal like SIGFPE or SIGSTKFLT
+     * can be used instead of SIGSEGV to avoid making it look like the
+     * code actually crashed at the current point of execution.
+     *
+     * (Observed behavior: with SIGFPE, debuggerd will dump the target
+     * thread and then the thread that calls dvmAbort.  With SIGSEGV,
+     * you don't get the second stack trace; possibly something in the
+     * kernel decides that a signal has already been sent and it's time
+     * to just kill the process.  The position in the current thread is
+     * generally known, so the second dump is not useful.)
+     *
+     * The target thread can continue to execute between the two signals.
+     * (The first just causes debuggerd to attach to it.)
+     */
+    LOGD("threadid=%d: sending two SIGSTKFLTs to threadid=%d (tid=%d) to"
+         " cause debuggerd dump\n",
+        dvmThreadSelf()->threadId, thread->threadId, thread->systemTid);
+    pthread_kill(thread->handle, SIGSTKFLT);
+    usleep(2 * 1000 * 1000);    // TODO: timed-wait until debuggerd attaches
+    pthread_kill(thread->handle, SIGSTKFLT);
+    LOGD("Sent, pausing to let debuggerd run\n");
+    usleep(8 * 1000 * 1000);    // TODO: timed-wait until debuggerd finishes
+
+    /* ignore SIGSEGV so the eventual dmvAbort() doesn't notify debuggerd */
+    signal(SIGSEGV, SIG_IGN);
+    LOGD("Continuing\n");
 }
 
 #ifdef WITH_MONITOR_TRACKING
@@ -3757,8 +4029,19 @@ static void gcScanThread(Thread *thread)
      * RUNNING without a suspend-pending check, so this shouldn't cause
      * a false-positive.)
      */
-    assert(thread->status != THREAD_RUNNING || thread->isSuspended ||
-            thread == dvmThreadSelf());
+    if (thread->status == THREAD_RUNNING && !thread->isSuspended &&
+        thread != dvmThreadSelf())
+    {
+        Thread* self = dvmThreadSelf();
+        LOGW("threadid=%d: BUG: GC scanning a running thread (%d)\n",
+            self->threadId, thread->threadId);
+        dvmDumpThread(thread, true);
+        LOGW("Found by:\n");
+        dvmDumpThread(self, false);
+
+        /* continue anyway? */
+        dvmAbort();
+    }
 
     HPROF_SET_GC_SCAN_STATE(HPROF_ROOT_THREAD_OBJECT, thread->threadId);
 

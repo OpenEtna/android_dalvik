@@ -37,6 +37,7 @@ enum {
     DEBUG_ENABLE_DEBUGGER           = 1,
     DEBUG_ENABLE_CHECKJNI           = 1 << 1,
     DEBUG_ENABLE_ASSERT             = 1 << 2,
+    DEBUG_ENABLE_SAFEMODE           = 1 << 3,
 };
 
 /*
@@ -269,6 +270,11 @@ static void Dalvik_dalvik_system_Zygote_fork(const u4* args, JValue* pResult)
  *   If set, make sure assertions are enabled.  This gets fairly weird,
  *   because it affects the result of a method called by class initializers,
  *   and hence can't affect pre-loaded/initialized classes.
+ * safemode
+ *   If set, operates the VM in the safe mode. The definition of "safe mode" is
+ *   implementation dependent and currently only the JIT compiler is disabled.
+ *   This is easy to handle because the compiler thread and associated resources
+ *   are not requested until we call dvmInitAfterZygote().
  */
 static void enableDebugFeatures(u4 debugFlags)
 {
@@ -285,6 +291,37 @@ static void enableDebugFeatures(u4 debugFlags)
         /* turn it on if it's not already enabled */
         dvmLateEnableAssertions();
     }
+
+    if ((debugFlags & DEBUG_ENABLE_SAFEMODE) != 0) {
+#if defined(WITH_JIT)
+        /* turn off the jit if it is explicitly requested by the app */
+        if (gDvm.executionMode == kExecutionModeJit)
+            gDvm.executionMode = kExecutionModeInterpFast;
+#endif
+    }
+
+#if HAVE_ANDROID_OS
+    if ((debugFlags & DEBUG_ENABLE_DEBUGGER) != 0) {
+        /* To let a non-privileged gdbserver attach to this
+         * process, we must set its dumpable bit flag. However
+         * we are not interested in generating a coredump in
+         * case of a crash, so also set the coredump size to 0
+         * to disable that
+         */
+        if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) < 0) {
+            LOGE("could not set dumpable bit flag for pid %d, errno=%d",
+                 getpid(), errno);
+        } else {
+            struct rlimit rl;
+            rl.rlim_cur = 0;
+            rl.rlim_max = RLIM_INFINITY;
+            if (setrlimit(RLIMIT_CORE, &rl) < 0) {
+                LOGE("could not disable core file generation "
+                     "for pid %d, errno=%d", getpid(), errno);
+            }
+        }
+    }
+#endif
 }
 
 /* 
@@ -429,4 +466,3 @@ const DalvikNativeMethod dvm_dalvik_system_Zygote[] = {
         Dalvik_dalvik_system_Zygote_forkSystemServer },
     { NULL, NULL, NULL },
 };
-

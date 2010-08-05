@@ -180,6 +180,8 @@ static void loadSFieldFromDex(ClassObject* clazz,
     const DexField* pDexSField, StaticField* sfield);
 static void loadIFieldFromDex(ClassObject* clazz,
     const DexField* pDexIField, InstField* field);
+static bool precacheReferenceOffsets(ClassObject* clazz);
+static void computeRefOffsets(ClassObject* clazz);
 static void freeMethodInnards(Method* meth);
 static bool createVtable(ClassObject* clazz);
 static bool createIftable(ClassObject* clazz);
@@ -1393,7 +1395,7 @@ static ClassObject* findClassNoInit(const char* descriptor, Object* loader,
      * making it an informative abort rather than an assert).
      */
     if (dvmCheckException(self)) {
-        LOGE("Class lookup %s attemped while exception %s pending\n",
+        LOGE("Class lookup %s attempted while exception %s pending\n",
             descriptor, dvmGetException(self)->clazz->descriptor);
         dvmDumpAllThreads(false);
         dvmAbort();
@@ -2115,6 +2117,7 @@ static void loadMethodFromDex(ClassObject* clazz, const DexMethod* pDexMethod,
     }
 }
 
+#if 0       /* replaced with private/read-write mapping */
 /*
  * We usually map bytecode directly out of the DEX file, which is mapped
  * shared read-only.  If we want to be able to modify it, we have to make
@@ -2162,6 +2165,7 @@ void dvmMakeCodeReadOnly(Method* meth)
     LOGV("+++ marking %p read-only\n", methodDexCode);
     dvmLinearReadOnly(meth->clazz->classLoader, methodDexCode);
 }
+#endif
 
 
 /*
@@ -2289,7 +2293,7 @@ static void loadIFieldFromDex(ClassObject* clazz,
 /*
  * Cache java.lang.ref.Reference fields and methods.
  */
-static bool precacheReferenceOffsets(ClassObject *clazz)
+static bool precacheReferenceOffsets(ClassObject* clazz)
 {
     Method *meth;
     int i;
@@ -2368,22 +2372,57 @@ static bool precacheReferenceOffsets(ClassObject *clazz)
                 "vmData", "I");
     assert(gDvm.offJavaLangRefReference_vmData >= 0);
 
-#if FANCY_REFERENCE_SUBCLASS
-    meth = dvmFindVirtualMethodByDescriptor(clazz, "clear", "()V");
-    assert(meth != NULL);
-    gDvm.voffJavaLangRefReference_clear = meth->methodIndex;
-
-    meth = dvmFindVirtualMethodByDescriptor(clazz, "enqueue", "()Z");
-    assert(meth != NULL);
-    gDvm.voffJavaLangRefReference_enqueue = meth->methodIndex;
-#else
     /* enqueueInternal() is private and thus a direct method. */
     meth = dvmFindDirectMethodByDescriptor(clazz, "enqueueInternal", "()Z");
     assert(meth != NULL);
     gDvm.methJavaLangRefReference_enqueueInternal = meth;
-#endif
 
     return true;
+}
+
+
+/*
+ * Set the bitmap of reference offsets, refOffsets, from the ifields
+ * list.
+ */
+static void computeRefOffsets(ClassObject* clazz)
+{
+    if (clazz->super != NULL) {
+        clazz->refOffsets = clazz->super->refOffsets;
+    } else {
+        clazz->refOffsets = 0;
+    }
+    /*
+     * If our superclass overflowed, we don't stand a chance.
+     */
+    if (clazz->refOffsets != CLASS_WALK_SUPER) {
+        InstField *f;
+        int i;
+
+        /* All of the fields that contain object references
+         * are guaranteed to be at the beginning of the ifields list.
+         */
+        f = clazz->ifields;
+        const int ifieldRefCount = clazz->ifieldRefCount;
+        for (i = 0; i < ifieldRefCount; i++) {
+          /*
+           * Note that, per the comment on struct InstField,
+           * f->byteOffset is the offset from the beginning of
+           * obj, not the offset into obj->instanceData.
+           */
+          assert(f->byteOffset >= (int) CLASS_SMALLEST_OFFSET);
+          assert((f->byteOffset & (CLASS_OFFSET_ALIGNMENT - 1)) == 0);
+          if (CLASS_CAN_ENCODE_OFFSET(f->byteOffset)) {
+              u4 newBit = CLASS_BIT_FROM_OFFSET(f->byteOffset);
+              assert(newBit != 0);
+              clazz->refOffsets |= newBit;
+          } else {
+              clazz->refOffsets = CLASS_WALK_SUPER;
+              break;
+          }
+          f++;
+        }
+    }
 }
 
 
@@ -2753,6 +2792,13 @@ bail_during_resolve:
             }
         }
     }
+
+    /*
+     * Compact the offsets the GC has to examine into a bitmap, if
+     * possible.  (This has to happen after Reference.referent is
+     * massaged in precacheReferenceOffsets.)
+     */
+    computeRefOffsets(clazz);
 
     /*
      * Done!
@@ -4240,8 +4286,10 @@ bool dvmInitClass(ClassObject* clazz)
             (gDvm.classVerifyMode == VERIFY_MODE_REMOTE &&
              clazz->classLoader == NULL))
         {
+            /* advance to "verified" state */
             LOGV("+++ not verifying class %s (cl=%p)\n",
                 clazz->descriptor, clazz->classLoader);
+            clazz->status = CLASS_VERIFIED;
             goto noverify;
         }
 
@@ -4274,6 +4322,11 @@ verify_failed:
         clazz->status = CLASS_VERIFIED;
     }
 noverify:
+
+#ifdef WITH_DEBUGGER
+    /* update instruction stream now that the verifier is done */
+    dvmFlushBreakpoints(clazz);
+#endif
 
     if (clazz->status == CLASS_INITIALIZED)
         goto bail_unlock;
@@ -4346,6 +4399,11 @@ noverify:
         dvmUnlockObject(self, (Object*) clazz);
         throwEarlierClassFailure(clazz);
         return false;
+    }
+
+    u8 startWhen = 0;
+    if (gDvm.allocProf.enabled) {
+        startWhen = dvmGetRelativeTimeNsec();
     }
 
     /*
@@ -4421,44 +4479,6 @@ noverify:
         dvmCallMethod(self, method, NULL, &unused);
     }
 
-    /* Set the bitmap of reference offsets. Except for class Object,
-     * start with the superclass offsets.
-     */
-    if (clazz->super != NULL) {
-        clazz->refOffsets = clazz->super->refOffsets;
-    } else {
-        clazz->refOffsets = 0;
-    }
-    /*
-     * If our superclass overflowed, we don't stand a chance.
-     */
-    if (clazz->refOffsets != CLASS_WALK_SUPER) {
-        InstField *f;
-        int i;
-
-        /* All of the fields that contain object references
-         * are guaranteed to be at the beginning of the ifields list.
-         */
-        f = clazz->ifields;
-        for (i = 0; i < clazz->ifieldRefCount; i++) {
-            /*
-             * Note that, per the comment on struct InstField,
-             * f->byteOffset is the offset from the beginning of
-             * obj, not the offset into obj->instanceData.
-             */
-            assert(f->byteOffset >= (int) CLASS_SMALLEST_OFFSET);
-            assert((f->byteOffset & (CLASS_OFFSET_ALIGNMENT - 1)) == 0);
-            u4 newBit = CLASS_BIT_FROM_OFFSET(f->byteOffset);
-            if (newBit != 0) {
-                clazz->refOffsets |= newBit;
-            } else {
-                clazz->refOffsets = CLASS_WALK_SUPER;
-                break;
-            }
-            f++;
-        }
-    }
-
     if (dvmCheckException(self)) {
         /*
          * We've had an exception thrown during static initialization.  We
@@ -4477,6 +4497,17 @@ noverify:
         dvmLockObject(self, (Object*) clazz);
         clazz->status = CLASS_INITIALIZED;
         LOGVV("Initialized class: %s\n", clazz->descriptor);
+
+        /*
+         * Update alloc counters.  TODO: guard with mutex.
+         */
+        if (gDvm.allocProf.enabled && startWhen != 0) {
+            u8 initDuration = dvmGetRelativeTimeNsec() - startWhen;
+            gDvm.allocProf.classInitTime += initDuration;
+            self->allocProf.classInitTime += initDuration;
+            gDvm.allocProf.classInitCount++;
+            self->allocProf.classInitCount++;
+        }
     }
 
 bail_notify:
