@@ -35,7 +35,7 @@ public final class VMDebug {
     /**
      * Specifies the default method trace data file name.
      *
-     * @deprecated only used in one place, which is unused and deprecated
+     * @_deprecated only used in one place, which is unused and deprecated
      */
     static public final String DEFAULT_METHOD_TRACE_FILE_NAME = "/sdcard/dmtrace.trace";
 
@@ -68,8 +68,12 @@ public final class VMDebug {
         KIND_FREED_BYTES;
     public static final int KIND_GLOBAL_GC_INVOCATIONS =
         KIND_GC_INVOCATIONS;
+    /**
+     * @hide */
     public static final int KIND_GLOBAL_CLASS_INIT_COUNT =
         KIND_CLASS_INIT_COUNT;
+    /**
+     * @hide */
     public static final int KIND_GLOBAL_CLASS_INIT_TIME =
         KIND_CLASS_INIT_TIME;
     public static final int KIND_GLOBAL_EXT_ALLOCATED_OBJECTS =
@@ -91,8 +95,12 @@ public final class VMDebug {
         KIND_FREED_BYTES << 16;
     public static final int KIND_THREAD_GC_INVOCATIONS =
         KIND_GC_INVOCATIONS << 16;
+    /**
+     * @hide */
     public static final int KIND_THREAD_CLASS_INIT_COUNT =
         KIND_CLASS_INIT_COUNT << 16;
+    /**
+     * @hide */
     public static final int KIND_THREAD_CLASS_INIT_TIME =
         KIND_CLASS_INIT_TIME << 16;
     public static final int KIND_THREAD_EXT_ALLOCATED_OBJECTS =
@@ -144,7 +152,7 @@ public final class VMDebug {
      * Start method tracing with default name, size, and with <code>0</code>
      * flags.
      *
-     * @deprecated not used, not needed
+     * @_deprecated not used, not needed
      */
     public static void startMethodTracing() {
         startMethodTracing(DEFAULT_METHOD_TRACE_FILE_NAME, 0, 0);
