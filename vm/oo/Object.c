@@ -216,11 +216,6 @@ static inline int compareMethodHelper(Method* method, const char* methodName,
     }
 
     proto = &method->prototype;
-
-    if( proto->dexFile == NULL ) {
-      LOGW("WARNING: Comparing method '%s' by name only because of hack found a match\n",methodName);
-      return 0;
-    }
         
     if (strcmp(returnType, dexProtoGetReturnType(proto)) != 0) {
         return 1;

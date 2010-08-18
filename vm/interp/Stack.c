@@ -372,11 +372,6 @@ static ClassObject* callPrep(Thread* self, const Method* method, Object* obj,
     assert(self != NULL);
     assert(method != NULL);
 
-    if( method == 0xFFFFFFFF ) {
-          LOGE("ERROR: Calling native stub function, returning\n");
-          return NULL;
-    }
-
     if (obj != NULL)
         clazz = obj->clazz;
     else

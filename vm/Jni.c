@@ -2459,10 +2459,16 @@ static jmethodID GetMethodID(JNIEnv* env, jclass jclazz, const char* name,
             meth = NULL;
         }
         if (meth == NULL) {
+#if 0
             LOGW("WARNING: Method not found: '%s' '%s' in %s - creating stub\n",
                  name, sig, clazz->descriptor);
-#if 1
+    #if 0
+            JNI_EXIT();
+            return 0xFFFFFFFF;
+    #else
             /* create new method */
+            /* this is very broken because it does not fill the signature field and this may
+             * produce crashes in the future */
             clazz->virtualMethodCount++;
             Method* oldMeth = clazz->virtualMethods;
             clazz->virtualMethods = (Method*) dvmLinearAlloc(clazz->classLoader,
@@ -2484,9 +2490,11 @@ static jmethodID GetMethodID(JNIEnv* env, jclass jclazz, const char* name,
               dvmLinearFree( clazz->classLoader, oldMeth );
             }
             meth = &clazz->virtualMethods[clazz->virtualMethodCount-1];
+    #endif
 #else
-            meth = 0xFFFFFFFF;
-            //dvmThrowException("Ljava/lang/NoSuchMethodError;", name);
+            LOGE("GetMethodID: method not found: %s.%s:%s\n",
+                            clazz->descriptor, name, sig);
+            dvmThrowException("Ljava/lang/NoSuchMethodError;", name);
 #endif
         }
 
@@ -2519,10 +2527,13 @@ static jfieldID GetFieldID(JNIEnv* env, jclass jclazz,
     if (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz)) {
         assert(dvmCheckException(_self));
         id = NULL;
+        LOGE("GetFieldID: class not initalized for field %s.%s:%s\n",
+                        clazz->descriptor, name, sig);
+        dvmThrowException("Ljava/lang/NoSuchFieldError;", name);
     } else {
         id = (jfieldID) dvmFindInstanceFieldHier(clazz, name, sig);
         if (id == NULL) {
-            LOGD("GetFieldID: unable to find field %s.%s:%s\n",
+            LOGE("GetFieldID: unable to find field %s.%s:%s\n",
                 clazz->descriptor, name, sig);
             dvmThrowException("Ljava/lang/NoSuchFieldError;", name);
         }
@@ -2585,6 +2596,7 @@ static jfieldID GetStaticFieldID(JNIEnv* env, jclass jclazz,
     if (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz)) {
         assert(dvmCheckException(_self));
         id = NULL;
+        dvmThrowException("Ljava/lang/NoSuchFieldError;", name);
     } else {
         id = (jfieldID) dvmFindStaticField(clazz, name, sig);
         if (id == NULL)
